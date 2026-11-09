@@ -1,0 +1,24 @@
+{
+  "name": "Pets Home — إدارة المزرعة",
+  "short_name": "Pets Home",
+  "description": "إدارة مخزون وإنتاج وأوردرات ومصروفات مزرعة Pets Home — تعمل بدون إنترنت",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "lang": "ar",
+  "dir": "rtl",
+  "background_color": "#EFF2EE",
+  "theme_color": "#1E6B57",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "أوردر جديد", "short_name": "أوردر", "url": "./#act-order", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "تسجيل إنتاج", "short_name": "إنتاج", "url": "./#act-production", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "مصروف جديد", "short_name": "مصروف", "url": "./#act-expense", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] }
+  ]
+}
