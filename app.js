@@ -1,5 +1,7 @@
-/* Pets Home — local edition: runs on one phone, no internet or accounts needed. All data is saved on the device (IndexedDB).
-   Stock by plates, production, orders, invoices, customers, expenses, counts, reports, audit log. */
+/* Pets Home — farm management app.
+   Local mode: all data on the phone (IndexedDB). Cloud mode (firebase-config.js filled): sign-in with the farm account,
+   data in Firestore with an offline copy, synced between devices.
+   Stock by plates, production, orders, invoices, customers, expenses, payroll, counts, reports, audit log. */
 (function () {
 "use strict";
 
@@ -13,8 +15,9 @@ const today = () => ymd(new Date());
 const addDays = (s, n) => { const d = new Date(s + "T12:00:00"); d.setDate(d.getDate() + n); return ymd(d); };
 const nf = (n, d = 2) => Number(n || 0).toLocaleString("en-US", { maximumFractionDigits: d });
 const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
-const cur = () => settings().currency || "ج.م";
-const money = n => `${nf(n, 2)} ${cur()}`;
+const cur = () => "ج.م";   // always Egyptian pounds
+const sgn = t => "\u2066" + t + "\u2069";   // isolate a signed number so the sign stays on its left in Arabic text
+const money = n => `${+n < 0 ? sgn("-" + nf(-n, 2)) : nf(n, 2)} ${cur()}`;
 const fmtDate = s => { if (!s) return ""; const [y, m, d] = s.split("-"); return `${d}/${m}/${y}`; };
 const fmtTime = iso => { if (!iso) return ""; const d = new Date(iso); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 const fmtDT = iso => { if (!iso) return ""; const d = new Date(iso); return `${fmtDate(ymd(d))} ${fmtTime(iso)}`; };
@@ -25,11 +28,11 @@ const pnum = v => { const x = parseFloat(String(v ?? "").trim().replace(/[٠-٩]
 const nowISO = () => new Date().toISOString();
 
 /* ================== State & on-device storage ================== */
-const APP_VERSION = "local-2";
+const APP_VERSION = "v3";
 /* Storage format version. Raise it only together with a migration in MIGRATIONS below — never by changing or dropping saved data. */
 const SCHEMA = 1;
 const PLAIN = ["meta", "items", "workers", "customers"];
-const BUCKETED = ["moves", "orders", "payments", "finance", "counts"];
+const BUCKETED = ["moves", "orders", "payments", "finance", "counts", "payroll"];
 const COLS = [...PLAIN, ...BUCKETED, "audit"];
 const S = {}; COLS.forEach(c => S[c] = new Map());
 let ver = 0; const memoCache = {};
@@ -103,7 +106,7 @@ const Local = {
     return ok;
   },
   async reload(cols) {
-    if (!Array.isArray(cols) || !cols.length) return;
+    if (MODE === "cloud" || !Array.isArray(cols) || !cols.length) return;
     const r = await this.read(cols); if (!r.ok) return;
     const data = r.data;
     cols.forEach(c => { if (COLS.includes(c) && !this.dirty.has(c)) S[c] = toMap(data[c]); });
@@ -136,21 +139,87 @@ const Local = {
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") Local.flush(); });
 window.addEventListener("pagehide", () => Local.flush());
 
+/* ================== Cloud (Firebase) ==================
+   Used when firebase-config.js holds real settings. Firestore keeps its own offline copy on the phone,
+   so the app keeps working without internet and uploads when the connection returns.
+   Layout: meta/items/workers/customers → one document per record; moves/orders/payments/finance/counts/payroll →
+   ledger/<type>_<YYYY-MM> documents with each record under r.<id>; audit/<YYYY-MM-DD> → { date, entries[] }. */
+let MODE = "local";
+let B = null;               // cloud backend (backend.js)
+let authUser;               // undefined = not known yet, null = signed out
+let cloudBooted = false;
+let localPending = null;    // records saved on this phone before cloud mode, waiting to be uploaded
+const AUDIT_WINDOW = 60;
+const recBucket = {};
+const cloudConfigured = () => { const c = window.PETSHOME_FIREBASE; return !!(c && c.apiKey && !String(c.apiKey).startsWith("PASTE")); };
+function cloudFail(e) {
+  console.error(e);
+  toast(e && e.code === "permission-denied" ? "لم يُحفظ: الحساب ده ليس له صلاحية على بيانات المزرعة." : "تعذر الحفظ على السحابة. هيتحفظ تلقائياً لما النت يرجع.");
+}
+const Cloud = {
+  started: false, ready: new Set(), timedOut: false, unsubs: [], timer: null, error: null,
+  start() {
+    if (this.started) return; this.started = true; this.ready.clear(); this.timedOut = false; this.error = null;
+    this.timer = setTimeout(() => { this.timedOut = true; scheduleRender(); }, 12000);
+    const fail = name => err => { console.error(name, err); if (err && err.code === "permission-denied") this.error = "denied"; this.ready.add(name); scheduleRender(); };
+    const done = name => { this.ready.add(name); if (this.isReady()) clearTimeout(this.timer); ver++; scheduleRender(); };
+    PLAIN.forEach(col => this.unsubs.push(B.watch(col, docs => {
+      S[col] = new Map(docs.map(d => [d.id, Object.assign({}, d.data, { id: d.id })])); done(col);
+    }, fail(col))));
+    this.unsubs.push(B.watch("ledger", docs => {
+      const maps = {}; BUCKETED.forEach(t => maps[t] = new Map());
+      docs.forEach(d => { const t = d.data.type; if (!maps[t]) return; Object.entries(d.data.r || {}).forEach(([id, rec]) => { if (rec) { maps[t].set(id, Object.assign({}, rec, { id })); recBucket[id] = d.id; } }); });
+      BUCKETED.forEach(t => S[t] = maps[t]); done("ledger");
+    }, fail("ledger")));
+    this.unsubs.push(B.watch("audit", docs => {
+      S.audit = new Map(docs.map(d => [d.id, Object.assign({}, d.data, { id: d.id })])); done("audit");
+    }, fail("audit"), { since: addDays(today(), -(AUDIT_WINDOW - 1)) }));
+  },
+  stop() {
+    this.unsubs.forEach(u => { try { u(); } catch {} }); this.unsubs = []; this.started = false; this.ready.clear(); clearTimeout(this.timer);
+    COLS.forEach(c => S[c] = new Map()); ver++;
+  },
+  isReady() { return this.timedOut || this.ready.size >= PLAIN.length + 2; },
+  ops(col, id, clean, del) {
+    if (BUCKETED.includes(col)) {
+      const old = recBucket[id];
+      if (del) { delete recBucket[id]; return old ? [{ kind: "unbucket", bid: old, id }] : []; }
+      const month = String(clean.date || today()).slice(0, 7), bid = `${col}_${month}`;
+      const out = [{ kind: "bucket", bid, meta: { type: col, month }, id, data: clean }];
+      if (old && old !== bid) out.push({ kind: "unbucket", bid: old, id });
+      recBucket[id] = bid; return out;
+    }
+    return del ? [{ kind: "del", col, id }] : [{ kind: "set", col, id, data: clean }];
+  }
+};
+
+/* One way to save, whichever mode: the screen updates at once, then the change is written to the phone or the cloud. */
 const Store = {
   newId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); },
-  put(col, id, data) {
-    const clean = JSON.parse(JSON.stringify(data)); delete clean.id;
-    const m = new Map(S[col]); m.set(id, Object.assign({}, clean, { id })); S[col] = m; ver++; Local.mark(col); scheduleRender();
-    return Promise.resolve();
-  },
-  remove(col, id) {
-    const m = new Map(S[col]); m.delete(id); S[col] = m; ver++; Local.mark(col); scheduleRender();
+  put(col, id, data) { return this.bulk([{ op: "put", col, id, data }]); },
+  remove(col, id) { return this.bulk([{ op: "del", col, id }]); },
+  bulk(list) {
+    const maps = {}, M = c => maps[c] || (maps[c] = new Map(S[c])), cloudOps = [];
+    for (const o of list) {
+      if (o.op === "put") {
+        const clean = JSON.parse(JSON.stringify(o.data)); delete clean.id;
+        M(o.col).set(o.id, Object.assign({}, clean, { id: o.id }));
+        if (MODE === "cloud") cloudOps.push(...Cloud.ops(o.col, o.id, clean, false));
+      } else {
+        M(o.col).delete(o.id);
+        if (MODE === "cloud") cloudOps.push(...Cloud.ops(o.col, o.id, null, true));
+      }
+    }
+    Object.keys(maps).forEach(c => { S[c] = maps[c]; if (MODE !== "cloud") Local.mark(c); });
+    ver++;
+    if (MODE === "cloud" && cloudOps.length) B.batchWrite(cloudOps).catch(cloudFail);
+    scheduleRender();
     return Promise.resolve();
   }
 };
 
 /* ================== Domain helpers ================== */
-const settings = () => S.meta.get("settings") || { farmName: "Pets Home", currency: "ج.م" };
+const settings = () => S.meta.get("settings") || { farmName: "Pets Home" };
 const items = (all = false) => [...S.items.values()].filter(i => all || i.active !== false).sort((a, b) => (a.name || "").localeCompare(b.name || "", "ar"));
 const item = id => S.items.get(id);
 const itemName = id => item(id)?.name || "صنف محذوف";
@@ -232,7 +301,7 @@ const totalReceivable = () => { let t = 0; custBalances().forEach(r => { if (r.d
 const inRange = (d, f, t) => (!f || d >= f) && (!t || d <= t);
 function moneySummary(f, t) {
   return memo("ms:" + f + ":" + t, () => {
-    const r = { sales: 0, orders: 0, collectedAtOrder: 0, payments: 0, income: 0, incomeCash: 0, expense: 0, expenseCash: 0, expenseCredit: 0, byCat: {} };
+    const r = { sales: 0, orders: 0, collectedAtOrder: 0, payments: 0, income: 0, incomeCash: 0, expense: 0, expenseCash: 0, expenseCredit: 0, payroll: 0, byCat: {} };
     for (const o of S.orders.values()) if (o.status !== "cancelled" && inRange(o.date, f, t)) { r.sales += +o.total || 0; r.orders++; r.collectedAtOrder += +o.paidNow || 0; }
     for (const p of S.payments.values()) if (inRange(p.date, f, t)) r.payments += +p.amount || 0;
     for (const x of S.finance.values()) if (inRange(x.date, f, t)) {
@@ -240,17 +309,22 @@ function moneySummary(f, t) {
       if (x.kind === "income") { r.income += a; if (x.payType !== "credit") r.incomeCash += a; }
       else { r.expense += a; if (x.payType === "credit") r.expenseCredit += a; else r.expenseCash += a; r.byCat[x.category] = (r.byCat[x.category] || 0) + a; }
     }
+    /* Payroll: cash advances and salary payments are expenses on the day the money leaves. */
+    for (const p of S.payroll.values()) if ((p.type === "advance" || p.type === "payout") && inRange(p.date, f, t)) {
+      const a = +p.amount || 0; r.expense += a; r.expenseCash += a; r.payroll += a; r.byCat["مرتبات"] = (r.byCat["مرتبات"] || 0) + a;
+    }
     r.net = r2(r.sales + r.income - r.expense);
     return r;
   });
 }
 
 /* ================== Audit log ================== */
-const FIELD_LABEL = { date: "التاريخ", itemId: "الصنف", plates: "الأطباق", qty: "الكمية", note: "ملاحظة", reason: "السبب", amount: "المبلغ", category: "البند", kind: "النوع", payType: "طريقة الدفع", customerId: "العميل", lines: "الأصناف", total: "الإجمالي", subtotal: "قبل الخصم", paidNow: "المدفوع", status: "الحالة", discount: "الخصم", name: "الاسم", price: "السعر", perPlate: "وزن/عدد الطبق", unit: "الوحدة", role: "الدور", perms: "الصلاحيات", active: "نشط", orderId: "الأوردر", method: "الطريقة", phone: "التليفون", minPlates: "حد التنبيه", priceBasis: "أساس السعر", farmName: "اسم المزرعة", currency: "العملة", by: "العامل المسؤول", ownerName: "اسم المدير" };
+const FIELD_LABEL = { date: "التاريخ", itemId: "الصنف", plates: "الأطباق", qty: "الكمية", note: "ملاحظة", reason: "السبب", amount: "المبلغ", category: "البند", kind: "النوع", payType: "طريقة الدفع", customerId: "العميل", lines: "الأصناف", total: "الإجمالي", subtotal: "قبل الخصم", paidNow: "المدفوع", status: "الحالة", discount: "الخصم", name: "الاسم", price: "السعر", perPlate: "وزن/عدد الطبق", unit: "الوحدة", role: "الدور", perms: "الصلاحيات", active: "نشط", orderId: "الأوردر", method: "الطريقة", phone: "التليفون", minPlates: "حد التنبيه", priceBasis: "أساس السعر", farmName: "اسم المزرعة", currency: "العملة", by: "العامل المسؤول", ownerName: "اسم المدير", empId: "الموظف", type: "النوع", days: "الأيام", startMonth: "بداية المرتب" };
 function fmtVal(k, v) {
   if (v == null || v === "") return "—";
   if (k === "itemId") return itemName(v);
-  if (k === "by") return wName(v);
+  if (k === "by" || k === "empId") return wName(v);
+  if (k === "type" && PAY_TYPES[v]) return PAY_TYPES[v].label;
   if (k === "customerId") return custName(v);
   if (k === "lines") return (v || []).map(l => `${itemName(l.itemId)} ${nf(l.plates)}ط`).join("، ");
   if (k === "status") return (ST_LABEL[v] || [v])[0];
@@ -260,7 +334,7 @@ function fmtVal(k, v) {
 }
 function diff(a, b) {
   const out = []; const keys = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
-  keys.forEach(k => { if (["id","at","no","editedAt","editedBy","ownerUid","username","lastBackup","demo","createdAt"].includes(k)) return; if (JSON.stringify(a?.[k]) !== JSON.stringify(b?.[k])) out.push({ f: k, from: fmtVal(k, a?.[k]), to: fmtVal(k, b?.[k]) }); });
+  keys.forEach(k => { if (["id","at","no","editedAt","editedBy","ownerUid","username","lastBackup","demo","createdAt","salaryHistory","salary","endMonth","currency"].includes(k)) return; if (JSON.stringify(a?.[k]) !== JSON.stringify(b?.[k])) out.push({ f: k, from: fmtVal(k, a?.[k]), to: fmtVal(k, b?.[k]) }); });
   return out;
 }
 function audit(action, entity, entityId, summary, before, after) {
@@ -268,7 +342,11 @@ function audit(action, entity, entityId, summary, before, after) {
   const e = { at: nowISO(), by, action, entity, entityId: entityId || "", summary };
   if (before && after) e.changes = diff(before, after);
   const cur = S.audit.get(date);
-  Store.put("audit", date, { date, entries: (cur ? cur.entries || [] : []).concat([e]) });
+  const docv = { date, entries: (cur ? cur.entries || [] : []).concat([e]) };
+  if (MODE === "cloud") {
+    const m = new Map(S.audit); m.set(date, Object.assign({}, docv, { id: date })); S.audit = m; ver++; scheduleRender();
+    B.appendAudit(date, { date }, e).catch(err => console.error("audit", err));
+  } else Store.put("audit", date, docv);
 }
 const allAudit = () => memo("audit", () => { const out = []; for (const d of S.audit.values()) (d.entries || []).forEach(e => out.push(e)); return out.sort((a, b) => a.at < b.at ? 1 : -1); });
 
@@ -302,6 +380,7 @@ const ICONS = {
   install: '<path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/>',
   logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/>'
 };
+ICONS.payroll = '<rect x="2" y="6" width="20" height="14" rx="2"/><path d="M2 10h20M6 15h4"/><circle cx="16.5" cy="15" r="1.5"/>';
 ICONS.backup = '<path d="M5 4h11l3 3v13H5z"/><path d="M8 4v5h7V4M8 20v-6h8v6"/>';
 const icon = k => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[k]}</svg>`;
 const ROUTES = [
@@ -310,6 +389,7 @@ const ROUTES = [
   { id: "production", label: "الإنتاج اليومي", short: "الإنتاج", ok: () => can("production") },
   { id: "orders", label: "الأوردرات والفواتير", short: "الأوردرات", ok: () => can("orders") || can("payments") },
   { id: "customers", label: "العملاء والحسابات", short: "العملاء", ok: () => can("orders") || can("payments") },
+  { id: "payroll", label: "المرتبات", short: "المرتبات", ok: () => true },
   { id: "finance", label: "المصروفات والإيرادات", short: "المصروفات", ok: () => can("finance") },
   { id: "count", label: "الجرد الفعلي", short: "الجرد", ok: () => can("count") },
   { id: "reports", label: "التقارير", short: "التقارير", ok: () => can("reports") },
@@ -416,7 +496,20 @@ function render() {
       <button type="button" class="btn primary block" onclick="location.reload()">إعادة المحاولة</button></div></div>`;
     return;
   }
+  if (phase === "cloudfail") {
+    app.innerHTML = `<div class="screen"><div class="card"><div class="logo">Pets Home</div><p>تعذر تحميل التطبيق. أول تشغيل بعد التحديث يحتاج اتصال بالإنترنت، وبعدها يشتغل بدونه.</p>
+      <button type="button" class="btn primary block" onclick="location.reload()">إعادة المحاولة</button></div></div>`;
+    return;
+  }
   if (phase !== "ready") return screenMsg(app, "جاري فتح Pets Home…");
+  if (MODE === "cloud") {
+    if (authUser === undefined) return screenMsg(app, "جاري فتح Pets Home…");
+    if (!authUser) return renderLogin(app);
+    if (Cloud.error === "denied") return renderDenied(app);
+    if (!Cloud.started) Cloud.start();
+    if (!Cloud.isReady()) return screenMsg(app, "جاري تحميل بيانات المزرعة…");
+    if (!cloudBooted) { cloudBooted = true; cloudAfterReady(); }
+  }
   if (!S.meta.get("settings")) return renderWelcome(app);
   if (!routeOf(route)?.ok()) route = "dashboard";
   const s = settings(); const r = routeOf(route);
@@ -425,13 +518,13 @@ function render() {
     <aside class="rail">
       <div class="brand"><span class="name">${esc(s.farmName || "Pets Home")}</span><span class="sub">إدارة المزرعة والمخزون</span></div>
       <nav class="nav" aria-label="الأقسام">${ROUTES.filter(x => x.ok()).map(x => `<a href="#${x.id}" data-go="${x.id}" ${x.id === route ? 'aria-current="page"' : ""}>${icon(x.id)}${x.label}</a>`).join("")}</nav>
-      <div class="who"><div><b>${esc(ownerName())}</b> <span class="muted small">البيانات على هذا الجهاز</span></div>
-      <div class="actions"><button class="btn sm" data-act="backup">نسخة احتياطية</button>${installPrompt ? `<button class="btn sm" data-act="install">تثبيت التطبيق</button>` : ""}</div></div>
+      <div class="who"><div><b>${esc(ownerName())}</b> <span class="muted small">${MODE === "cloud" ? (navigator.onLine === false ? "غير متصل" : "متصل بالسحابة") : "البيانات على هذا الجهاز"}</span></div>
+      <div class="actions">${MODE === "cloud" ? `<button class="btn sm" data-act="account">حسابي</button>` : ""}<button class="btn sm" data-act="backup">نسخة احتياطية</button>${installPrompt ? `<button class="btn sm" data-act="install">تثبيت التطبيق</button>` : ""}</div></div>
     </aside>
     <div class="col">
       <header class="appbar"><div class="in"><div class="ttl"><span class="farm">${esc(s.farmName || "Pets Home")}</span><span class="page">${esc(r.label)}</span></div>
       <button class="avatar" data-act="more" aria-label="القائمة">${esc(ownerName().trim().charAt(0) || "P")}</button></div></header>
-      <main id="main">${s.demo ? `<div class="banner info">أنت تجرّب ببيانات تجريبية. لما تخلص، امسحها من «الإعدادات ← مسح كل البيانات» وابدأ ببياناتك.</div>` : ""}${VIEWS[route]()}</main>
+      <main id="main">${MODE === "cloud" && navigator.onLine === false ? `<div class="banner">أنت غير متصل بالإنترنت. سجّل عادي، والتسجيلات هتترفع للسحابة تلقائياً لما النت يرجع.</div>` : ""}${s.demo ? `<div class="banner info">أنت تجرّب ببيانات تجريبية. لما تخلص، امسحها من «الإعدادات ← مسح كل البيانات» وابدأ ببياناتك.</div>` : ""}${VIEWS[route]()}</main>
     </div>
     <nav class="tabbar" aria-label="التنقل">
       ${tabs.slice(0, 2).map(tabBtn).join("")}
@@ -448,11 +541,14 @@ const tabBtn = r => `<button type="button" data-go="${r.id}" ${r.id === route ? 
 function quickActions() {
   return [
     { id: "order", label: "أوردر جديد", ic: "orders", run: () => orderForm() },
+    { id: "advance", label: "سلفة لموظف", ic: "payroll", run: () => payEntryForm("advance") },
     { id: "production", label: "تسجيل إنتاج", ic: "production", run: () => moveForm("production") },
     { id: "withdraw", label: "سحب من المخزون", ic: "withdraw", run: () => moveForm("withdraw") },
     { id: "expense", label: "مصروف", ic: "finance", run: () => financeForm("expense") },
     { id: "payment", label: "تحصيل من عميل", ic: "pay", run: () => paymentForm() },
-    { id: "count", label: "جرد فعلي", ic: "count", run: () => go("count") }
+    { id: "count", label: "جرد فعلي", ic: "count", run: () => go("count") },
+    { id: "adjust", label: "خصم أو مكافأة", ic: "payroll", run: () => payEntryForm("deduct") },
+    { id: "payout", label: "صرف مرتب", ic: "pay", run: () => payEntryForm("payout") }
   ];
 }
 function showQuick() {
@@ -464,43 +560,48 @@ function showMore() {
   const rest = ROUTES.filter(r => !tabs.includes(r.id));
   openModal("المزيد", `<div class="sheet-grid">${rest.map(r => `<button type="button" data-go="${r.id}">${icon(r.id)}${esc(r.label)}</button>`).join("")}
     <button type="button" data-act="backup">${icon("backup")}نسخة احتياطية</button>
+    ${MODE === "cloud" ? `<button type="button" data-act="account">${icon("user")}حسابي</button>` : ""}
     ${installPrompt ? `<button type="button" data-act="install">${icon("install")}تثبيت التطبيق</button>` : ""}</div>`, { noFooter: true, noFocus: true });
 }
 function screenMsg(app, msg) { app.innerHTML = `<div class="screen"><div class="loading">${esc(msg)}</div></div>`; }
 
 /* ---------- First run ---------- */
 function renderWelcome(app) {
+  const cloud = MODE === "cloud";
   app.innerHTML = `<div class="screen"><form class="card" id="welcome" novalidate>
-    <div><div class="logo">Pets Home</div><p class="muted">نسخة تجريبية تعمل على هذا الموبايل فقط، بدون إنترنت وبدون حسابات. كل البيانات تُحفظ على الجهاز.</p></div>
+    <div><div class="logo">Pets Home</div><p class="muted">${cloud ? "أول مرة على الحساب ده: اكتب بيانات المزرعة. أي جهاز هيدخل بنفس الحساب هيشوف نفس البيانات." : "نسخة تجريبية تعمل على هذا الموبايل فقط، بدون إنترنت وبدون حسابات. كل البيانات تُحفظ على الجهاز."}</p></div>
+    ${cloud && localPending ? `<div class="banner info">على الموبايل ده ${nf(localPending.count, 0)} سجل محفوظين من قبل. ارفعهم للحساب عشان تكمل بنفس البيانات.</div><button class="btn primary block" type="button" data-act="upload-local">رفع بيانات الموبايل للحساب</button>` : ""}
     <div class="form">
       ${field("اسم المزرعة", `<input type="text" name="farm" id="w-farm" value="Pets Home">`, "full")}
       ${field("اسمك", `<input type="text" name="name" id="w-name" autocomplete="name">`, "full", "يظهر في سجل العمليات")}
-      ${field("العملة", `<input type="text" name="cur" id="w-cur" value="ج.م">`, "full")}
     </div>
     <div class="err" id="w-err" hidden></div>
-    <button class="btn primary block" type="submit">ابدأ</button>
-    <button class="btn block" type="button" id="w-demo">جرّب ببيانات تجريبية أولاً</button>
+    <button class="btn ${cloud && localPending ? "" : "primary"} block" type="submit">${cloud && localPending ? "ابدأ من غير بيانات الموبايل" : "ابدأ"}</button>
+    ${cloud ? "" : `<button class="btn block" type="button" id="w-demo">جرّب ببيانات تجريبية أولاً</button>`}
     <label class="linkbtn" style="text-align:center">عندي نسخة احتياطية، استرجعها<input type="file" id="w-restore" accept=".json,application/json" hidden></label>
     ${Local.snapInfo && Local.snapInfo.count ? `<button class="btn block" type="button" id="w-snap">استرجاع البيانات السابقة من النسخة التلقائية (${nf(Local.snapInfo.count, 0)} سجل)</button>` : ""}
+    ${cloud ? `<button type="button" class="linkbtn" data-act="logout">تسجيل الخروج</button>` : ""}
   </form></div>`;
   const ws = $("#w-snap"); if (ws) ws.onclick = restoreSnapshot;
   $("#welcome").addEventListener("submit", e => {
     e.preventDefault(); const fd = new FormData(e.target); const name = fv(fd, "name");
     if (!name) { const er = $("#w-err"); er.textContent = "اكتب اسمك."; er.hidden = false; return; }
     document.activeElement && document.activeElement.blur();
-    Store.put("meta", "settings", { farmName: fv(fd, "farm") || "Pets Home", ownerName: name, currency: fv(fd, "cur") || "ج.م", createdAt: nowISO() });
+    Store.put("meta", "settings", { farmName: fv(fd, "farm") || "Pets Home", ownerName: name, createdAt: nowISO() });
     audit("إضافة", "settings", "settings", `بدء استخدام التطبيق — ${name}`);
     Local.flush();
   });
-  $("#w-demo").onclick = seedDemo;
+  const wd = $("#w-demo"); if (wd) wd.onclick = seedDemo;
   $("#w-restore").onchange = e => { const f = e.target.files[0]; if (!f) return; const rd = new FileReader(); rd.onload = () => importBackup(rd.result, true); rd.readAsText(f); e.target.value = ""; };
 }
 /* Sample farm data so the app can be explored before entering real records. */
 function seedDemo() {
   const t = today(), d = n => addDays(t, -n), at = (date, h) => new Date(`${date}T${pad(h)}:${pad(10 + (Object.keys(S).length % 40))}:00`).toISOString();
-  Store.put("meta", "settings", { farmName: "Pets Home", ownerName: "المدير", currency: "ج.م", createdAt: nowISO(), demo: true });
+  Store.put("meta", "settings", { farmName: "Pets Home", ownerName: "المدير", createdAt: nowISO(), demo: true });
   const W = [Store.newId(), Store.newId()];
-  Store.put("workers", W[0], { name: "محمود", phone: "", active: true }); Store.put("workers", W[1], { name: "سعيد", phone: "", active: true });
+  const pm0 = prevMonth(today().slice(0, 7));
+  Store.put("workers", W[0], { name: "محمود", phone: "", active: true, startMonth: pm0, salary: 4000, salaryHistory: [{ from: pm0, amount: 4000 }] });
+  Store.put("workers", W[1], { name: "سعيد", phone: "", active: true, startMonth: pm0, salary: 3500, salaryHistory: [{ from: pm0, amount: 3500 }] });
   const I = [Store.newId(), Store.newId(), Store.newId()];
   Store.put("items", I[0], { name: "ميل وورم", unit: "كجم", perPlate: 2, price: 150, priceBasis: "plate", minPlates: 10, active: true });
   Store.put("items", I[1], { name: "سوبر وورم", unit: "كجم", perPlate: 1.5, price: 220, priceBasis: "plate", minPlates: 6, active: true });
@@ -520,7 +621,11 @@ function seedDemo() {
   order(C[0], 0, [line(0, 5, 150)], 0, "prepared", OWNER_ID);
   Store.put("payments", Store.newId(), { customerId: C[1], orderId: o2, amount: 100, date: t, method: "نقدي", note: "", by: OWNER_ID, at: at(t, 11) });
   const fin = (kind, category, amount, day, payType, note) => Store.put("finance", Store.newId(), { kind, category, amount, date: d(day), payType, note, by: OWNER_ID, at: at(d(day), 16) });
-  fin("expense", "خامات", 600, 4, "cash", "ردة"); fin("expense", "أجور", 1200, 2, "cash", "أجور الأسبوع"); fin("expense", "نقل", 150, 0, "cash", "توصيل أوردر"); fin("expense", "أكل", 400, 1, "credit", "خضار للتغذية");
+  fin("expense", "خامات", 600, 4, "cash", "ردة"); fin("expense", "كهرباء ومياه", 300, 2, "cash", "فاتورة الكهرباء"); fin("expense", "نقل", 150, 0, "cash", "توصيل أوردر"); fin("expense", "أكل", 400, 1, "credit", "خضار للتغذية");
+  const pe = (empId, type, amount, date, extra = {}) => Store.put("payroll", Store.newId(), Object.assign({ empId, type, amount, date, note: "", by: OWNER_ID, at: at(date, 17) }, extra));
+  const pmEnd = monthRange(pm0).to;
+  pe(W[0], "payout", 4000, pmEnd); pe(W[1], "payout", 3500, pmEnd);
+  pe(W[0], "advance", 200, d(2), { note: "سلفة" }); pe(W[1], "absence", 116.67, d(3), { days: 1 }); pe(W[1], "bonus", 150, d(1), { note: "حافز إنتاج" });
   audit("إضافة", "demo", "", "تحميل بيانات تجريبية");
   Local.flush(); toast("تم تحميل بيانات تجريبية");
 }
@@ -554,7 +659,7 @@ VIEWS.dashboard = () => {
     <div class="kpi hero"><span>صافي حركة اليوم</span><b class="num">${money(ms.net)}</b><small>مبيعات + إيرادات − مصروفات</small></div>
     <div class="kpi ${totalReceivable() > 0 ? "bad" : ""}"><span>مستحق على العملاء</span><b class="num">${money(totalReceivable())}</b><small>الآجل والمتبقي</small></div>
   </section>
-  ${backupNag()}${low.length ? `<div class="banner">رصيد منخفض: ${low.map(i => `${esc(i.name)} (${nf(ss.get(i.id).closing)} طبق)`).join("، ")}</div>` : ""}
+  ${uploadBanner()}${backupNag()}${low.length ? `<div class="banner">رصيد منخفض: ${low.map(i => `${esc(i.name)} (${nf(ss.get(i.id).closing)} طبق)`).join("، ")}</div>` : ""}
   ${monthPanel()}
   <div class="grid2">
     <section class="panel"><div class="panel-head"><h2>رصيد الغرفة لكل صنف</h2><a href="#stock" data-go="stock" class="small">تفاصيل الحركة</a></div>
@@ -567,6 +672,7 @@ VIEWS.dashboard = () => {
   </div>`;
 };
 function backupNag() {
+  if (MODE === "cloud") return "";
   const s = settings(); if (s.demo || recordCount() < 3) return "";
   const last = s.lastBackup ? new Date(s.lastBackup) : null; const days = last ? Math.floor((Date.now() - last) / 864e5) : null;
   if (last && days < 7) return "";
@@ -589,7 +695,7 @@ VIEWS.stock = () => {
     <div class="filters"><label>الصنف<select id="st-item"><option value="">كل الأصناف</option>${itemOptions(stockItemFilter)}</select></label>
     <label>الفترة<select id="st-range">${opt(7, "آخر 7 أيام", stockRange)}${opt(30, "آخر 30 يوم", stockRange)}${opt(90, "آخر 90 يوم", stockRange)}${opt(0, "كل الحركة", stockRange)}</select></label></div>
     <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الصنف</th><th>النوع</th><th>التاريخ</th><th class="n">أطباق</th><th class="n">الكمية</th><th>البيان</th><th>بواسطة</th><th></th></tr></thead><tbody>
-    ${rows.length ? rows.map(e => `<tr><td>${esc(itemName(e.itemId))}</td><td>${pill([KIND[e.kind], e.plates >= 0 ? "good" : "bad"])}</td><td class="nowrap">${fmtDate(e.date)} <span class="muted small">${fmtTime(e.at)}</span></td><td class="n ${e.plates < 0 ? "neg" : "pos"}">${e.plates > 0 ? "+" : ""}${nf(e.plates)}</td><td class="n">${qtyStr(e.qty, e.itemId)}</td><td class="small">${esc(e.note) || "—"}</td><td class="small muted">${esc(wName(e.by))}</td><td class="nowrap">${e.src === "move" ? rowActions("move", e.id) : `<button class="btn sm" data-act="invoice" data-id="${e.id}">الفاتورة</button>`}</td></tr>`).join("") : emptyRow(8, "لا توجد حركة في هذه الفترة.")}
+    ${rows.length ? rows.map(e => `<tr><td>${esc(itemName(e.itemId))}</td><td>${pill([KIND[e.kind], e.plates >= 0 ? "good" : "bad"])}</td><td class="nowrap">${fmtDate(e.date)} <span class="muted small">${fmtTime(e.at)}</span></td><td class="n ${e.plates < 0 ? "neg" : "pos"}">${sgn((e.plates > 0 ? "+" : "") + nf(e.plates))}</td><td class="n">${qtyStr(e.qty, e.itemId)}</td><td class="small">${esc(e.note) || "—"}</td><td class="small muted">${esc(wName(e.by))}</td><td class="nowrap">${e.src === "move" ? rowActions("move", e.id) : `<button class="btn sm" data-act="invoice" data-id="${e.id}">الفاتورة</button>`}</td></tr>`).join("") : emptyRow(8, "لا توجد حركة في هذه الفترة.")}
     </tbody></table></div></section>`;
 };
 afterRender.stock = () => {
@@ -896,7 +1002,7 @@ function statementText(cid, from, to) {
 let finKind = "all", finDays = 31;
 VIEWS.finance = () => {
   const from = finDays ? addDays(today(), -finDays + 1) : "";
-  const list = [...S.finance.values()].filter(x => (!from || x.date >= from) && (finKind === "all" || x.kind === finKind || (finKind === "credit" && x.payType === "credit"))).sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (a.at < b.at ? 1 : -1));
+  const list = [...S.finance.values(), ...payrollCashRows()].filter(x => (!from || x.date >= from) && (finKind === "all" || x.kind === finKind || (finKind === "credit" && x.payType === "credit"))).sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (a.at < b.at ? 1 : -1));
   const ms = moneySummary(from, "");
   const cats = Object.entries(ms.byCat).sort((a, b) => b[1] - a[1]);
   const maxCat = Math.max(1, ...cats.map(c => c[1]));
@@ -906,7 +1012,7 @@ VIEWS.finance = () => {
   <section class="panel"><div class="seg" role="group" aria-label="النوع">${[["all", "الكل"], ["expense", "مصروفات"], ["income", "إيرادات"], ["credit", "آجل"]].map(([k, l]) => `<button type="button" data-fink="${k}" aria-pressed="${k === finKind}">${l}</button>`).join("")}</div>
   <div class="filters"><label>الفترة<select id="fi-days">${opt(1, "اليوم", finDays)}${opt(7, "آخر 7 أيام", finDays)}${opt(31, "آخر 31 يوم", finDays)}${opt(90, "آخر 90 يوم", finDays)}${opt(0, "الكل", finDays)}</select></label></div>
   <div class="tbl-wrap"><table class="rtable"><thead><tr><th>البند</th><th class="n">المبلغ</th><th>التاريخ</th><th>الدفع</th><th>البيان</th><th>بواسطة</th><th></th></tr></thead><tbody>
-  ${list.length ? list.map(x => `<tr><td>${esc(x.category)} ${x.kind === "income" ? pill(["إيراد", "good"]) : ""}</td><td class="n ${x.kind === "income" ? "pos" : "neg"}">${x.kind === "income" ? "+" : "−"}${nf(x.amount)}</td><td class="nowrap">${fmtDate(x.date)}</td><td>${x.payType === "credit" ? pill(["آجل", "warn"]) : "نقدي"}</td><td class="small">${esc(x.note || "") || "—"}</td><td class="small muted">${esc(wName(x.by))}</td><td class="nowrap">${rowActions("fin", x.id)}</td></tr>`).join("") : emptyRow(7, "لا توجد مصروفات أو إيرادات في هذه الفترة.")}
+  ${list.length ? list.map(x => `<tr><td>${esc(x.category)} ${x.kind === "income" ? pill(["إيراد", "good"]) : ""}</td><td class="n ${x.kind === "income" ? "pos" : "neg"}">${sgn((x.kind === "income" ? "+" : "−") + nf(x.amount))}</td><td class="nowrap">${fmtDate(x.date)}</td><td>${x.payType === "credit" ? pill(["آجل", "warn"]) : "نقدي"}</td><td class="small">${esc(x.note || "") || "—"}</td><td class="small muted">${esc(wName(x.by))}</td><td class="nowrap">${x._pe ? `<button class="btn sm" data-go="payroll">المرتبات</button>` : rowActions("fin", x.id)}</td></tr>`).join("") : emptyRow(7, "لا توجد مصروفات أو إيرادات في هذه الفترة.")}
   </tbody></table></div></section>
   <section class="panel"><h2>المصروفات حسب البند</h2>${cats.length ? cats.map(([c, v]) => `<div class="logline"><div style="display:flex;justify-content:space-between;gap:8px"><span>${esc(c)}</span><b class="num">${nf(v)}</b></div><div class="bar"><i style="width:${(v / maxCat * 100).toFixed(1)}%"></i></div></div>`).join("") : `<div class="empty">لا مصروفات في الفترة.</div>`}</section></div>`;
 };
@@ -1040,7 +1146,7 @@ function monthPanel() {
       <div class="kpi hero"><span>${monthLabel(cm)} حتى اليوم</span><b class="num">${money(R.net)}</b><small>إيرادات ${money(R.revenue)} − مصروفات ${money(R.ms.expense)}</small></div>
       ${prevHas ? `<div class="kpi"><span>${monthLabel(pm)} (مكتمل)</span><b class="num ${P.net < 0 ? "neg" : ""}">${money(P.net)}</b><small>هامش الربح ${pct(P.margin)}</small></div>`
         : `<div class="kpi"><span>هامش الربح</span><b class="num">${pct(R.margin)}</b><small>من الإيرادات</small></div>`}
-    </div></section>`;
+    </div>${payrollMonth(cm).people ? `<p class="small muted">مرتبات ${MONTHS[+cm.slice(5, 7) - 1]} المتبقية للصرف: <b class="num">${money(payrollMonth(cm).remaining)}</b> · <a href="#payroll" data-go="payroll">المرتبات</a></p>` : ""}</section>`;
 }
 const RTABS = [["monthly", "الأرباح الشهرية"], ["stock", "حركة المخزون"], ["production", "الإنتاج"], ["sales", "المبيعات"], ["expenses", "المصروفات"], ["pnl", "الأرباح والخسائر"], ["statement", "كشف حساب عميل"], ["cash", "حركة الخزنة"]];
 VIEWS.reports = () => `${headHtml("التقارير والحسابات", rp.tab === "monthly" ? `أرباح شهر ${monthLabel(rp.month)}` : `من ${fmtDate(rp.from)} إلى ${fmtDate(rp.to)}`)}
@@ -1083,7 +1189,9 @@ const REPORTS = {
         <div class="big"><span>= إجمالي الإيرادات</span><b class="num">${money(R.revenue)}</b></div>
         ${Object.entries(ms.byCat).sort((a, b) => b[1] - a[1]).map(([c, v]) => `<div class="small"><span>− ${esc(c)}</span><span class="num">${money(v)}</span></div>`).join("") || `<div class="small"><span>لا مصروفات مسجلة في الشهر</span><span></span></div>`}
         <div class="big"><span>− إجمالي المصروفات</span><b class="num">${money(ms.expense)}</b></div>
-        <div class="big"><span>= ${R.net >= 0 ? "صافي الربح" : "صافي الخسارة"}</span><b class="num ${R.net >= 0 ? "pos" : "neg"}">${money(Math.abs(R.net))}</b></div></div>
+        <div class="big"><span>= ${R.net >= 0 ? "صافي الربح" : "صافي الخسارة"}</span><b class="num ${R.net >= 0 ? "pos" : "neg"}">${money(Math.abs(R.net))}</b></div>
+        ${payrollMonth(R.ym).remaining > 0 ? `<div class="small"><span>مرتبات الشهر اللي لسه ما اتصرفتش</span><span class="num neg">${money(payrollMonth(R.ym).remaining)}</span></div>
+        <div class="small"><span>الربح بعد صرفها</span><b class="num">${money(r2(R.net - payrollMonth(R.ym).remaining))}</b></div>` : ""}</div>
         ${hasPrev ? `<h3>مقارنة بـ${monthLabel(pm)}</h3><div class="sum-box">
           <div class="small"><span></span><span class="muted">${MONTHS[+pm.slice(5, 7) - 1]} · ${MONTHS[+R.ym.slice(5, 7) - 1]}</span></div>
           <div class="small"><span>الإيرادات</span><span class="num">${nf(P.revenue)} · ${nf(R.revenue)}</span></div>
@@ -1137,7 +1245,7 @@ const REPORTS = {
     <h2>حسب العميل</h2><div class="tbl-wrap"><table class="rtable"><thead><tr><th>العميل</th><th class="n">أوردرات</th><th class="n">القيمة</th><th class="n">المدفوع</th><th class="n">المتبقي</th></tr></thead><tbody>${Object.keys(byCust).length ? Object.entries(byCust).sort((a, b) => b[1].v - a[1].v).map(([id, r]) => `<tr><td>${esc(custName(id))}</td><td class="n">${r.n}</td><td class="n">${nf(r.v)}</td><td class="n">${nf(r.paid)}</td><td class="n">${nf(r2(r.v - r.paid))}</td></tr>`).join("") : emptyRow(5, "—")}</tbody></table></div>`;
   },
   expenses() {
-    const list = [...S.finance.values()].filter(x => x.kind !== "income" && inRange(x.date, rp.from, rp.to)).sort((a, b) => a.date < b.date ? -1 : 1);
+    const list = [...S.finance.values(), ...payrollCashRows()].filter(x => x.kind !== "income" && inRange(x.date, rp.from, rp.to)).sort((a, b) => a.date < b.date ? -1 : 1);
     const cats = {}; list.forEach(x => (cats[x.category] = cats[x.category] || []).push(x));
     const sum = xs => xs.reduce((s, x) => s + +x.amount, 0);
     return `<h2>المصروفات حسب البند — ${money(sum(list))}</h2>${Object.keys(cats).length ? Object.entries(cats).sort((a, b) => sum(b[1]) - sum(a[1])).map(([c, xs]) => `<div class="tbl-wrap"><table class="rtable no-title"><thead><tr><th>${esc(c)}</th><th>البيان</th><th>الدفع</th><th class="n">${nf(sum(xs))}</th></tr></thead><tbody>${xs.map(x => `<tr><td class="nowrap" data-label="التاريخ">${fmtDate(x.date)}</td><td>${esc(x.note || "—")}</td><td>${x.payType === "credit" ? pill(["آجل", "warn"]) : "نقدي"}</td><td class="n" data-label="المبلغ">${nf(x.amount)}</td></tr>`).join("")}</tbody></table></div>`).join("") : `<div class="empty">لا مصروفات في الفترة.</div>`}`;
@@ -1160,6 +1268,7 @@ const REPORTS = {
     const rows = [];
     for (const o of S.orders.values()) if (o.status !== "cancelled" && +o.paidNow) rows.push({ date: o.date, at: o.at, desc: `مدفوع مع أوردر ${o.no} — ${custName(o.customerId)}`, inn: +o.paidNow, out: 0 });
     for (const p of S.payments.values()) rows.push({ date: p.date, at: p.at, desc: `تحصيل من ${custName(p.customerId)} (${p.method || "نقدي"})`, inn: +p.amount, out: 0 });
+    for (const p of payrollCashRows()) rows.push({ date: p.date, at: p.at, desc: `مرتبات: ${p.note}`, inn: 0, out: +p.amount });
     for (const x of S.finance.values()) if (x.payType !== "credit") rows.push({ date: x.date, at: x.at, desc: `${x.kind === "income" ? "إيراد" : "مصروف"} ${x.category}${x.note ? " — " + x.note : ""}`, inn: x.kind === "income" ? +x.amount : 0, out: x.kind === "income" ? 0 : +x.amount });
     rows.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.at || "") < (b.at || "") ? -1 : 1);
     let bal = 0, opening = 0, ti = 0, to = 0; const out = [];
@@ -1173,14 +1282,30 @@ const REPORTS = {
 };
 
 let lg = { from: addDays(today(), -6), to: today(), worker: "", q: "" };
+let logFetch = { key: "", docs: null, error: false };
+function logEntries() {
+  if (MODE !== "cloud" || lg.from >= addDays(today(), -(AUDIT_WINDOW - 1))) return allAudit();
+  const key = lg.from + "|" + lg.to;
+  if (logFetch.key !== key) {
+    logFetch = { key, docs: null, error: false };
+    B.queryAudit(lg.from, lg.to).then(docs => { if (logFetch.key === key) { logFetch.docs = docs.map(d => d.data); render(); } })
+      .catch(() => { if (logFetch.key === key) { logFetch.error = true; render(); } });
+  }
+  if (!logFetch.docs) return null;
+  const seen = new Set(), out = [];
+  [...logFetch.docs, ...S.audit.values()].forEach(d => (d.entries || []).forEach(e => { const k = e.at + "|" + e.summary; if (!seen.has(k)) { seen.add(k); out.push(e); } }));
+  return out.sort((a, b) => a.at < b.at ? 1 : -1);
+}
 VIEWS.log = () => {
-  let list = allAudit().filter(e => { const d = localDay(e.at); return d >= lg.from && d <= lg.to; });
+  const all = logEntries();
+  let list = (all || []).filter(e => { const d = localDay(e.at); return d >= lg.from && d <= lg.to; });
   if (lg.worker) list = list.filter(e => (e.by || OWNER_ID) === lg.worker);
   if (lg.q) list = list.filter(e => (e.summary || "").includes(lg.q));
   return `${headHtml("سجل العمليات", "كل عملية محفوظة بوقتها والعامل المسؤول. التعديلات تظهر بالقيمة القديمة والجديدة.")}
   <section class="panel"><div class="filters"><label>من<input type="date" id="lg-from" value="${lg.from}"></label><label>إلى<input type="date" id="lg-to" value="${lg.to}"></label>
   <label>العامل<select id="lg-w">${opt("", "الكل", lg.worker)}${opt(OWNER_ID, ownerName(), lg.worker)}${workers(true).map(w => opt(w.id, w.name, lg.worker)).join("")}</select></label>
   <label>بحث<input type="search" id="lg-q" placeholder="عميل، صنف، رقم أوردر" value="${esc(lg.q)}"></label></div>
+  ${all === null ? `<div class="empty">${logFetch.error ? "تعذر تحميل السجل لهذه الفترة. تحقق من الاتصال." : "جاري تحميل السجل…"}</div>` : ""}
   <div class="tbl-wrap"><table class="rtable no-title"><thead><tr><th>الوقت</th><th>العملية</th><th>التفاصيل</th><th>المسؤول</th></tr></thead><tbody>
   ${list.length ? list.slice(0, 500).map(e => `<tr><td class="nowrap small">${fmtDT(e.at)}</td><td>${pill([e.action, e.action === "حذف" || e.action === "إلغاء" ? "bad" : e.action === "تعديل" ? "warn" : "acc"])}</td><td class="span"><div class="logline"><span>${esc(e.summary)}</span>${(e.changes || []).length ? `<span class="changes">${e.changes.map(c => `${esc(FIELD_LABEL[c.f] || c.f)}: <del>${esc(c.from)}</del> ← <ins>${esc(c.to)}</ins>`).join(" · ")}</span>` : ""}</div></td><td class="small">${esc(wName(e.by))}</td></tr>`).join("") : emptyRow(4, "لا عمليات مطابقة.")}
   </tbody></table></div>${list.length > 500 ? `<p class="small muted">يظهر أحدث 500 عملية. ضيّق الفترة لعرض الباقي.</p>` : ""}</section>`;
@@ -1199,21 +1324,21 @@ VIEWS.admin = () => {
   <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الصنف</th><th class="n">الطبق =</th><th class="n">السعر</th><th class="n">تنبيه عند</th><th class="n">الرصيد</th><th>الحالة</th><th></th></tr></thead><tbody>
   ${items(true).length ? items(true).map(i => `<tr><td><b>${esc(i.name)}</b></td><td class="n">${nf(i.perPlate)} ${esc(i.unit)}</td><td class="n">${nf(i.price)} / ${i.priceBasis === "unit" ? esc(i.unit) : "طبق"}</td><td class="n">${+i.minPlates ? nf(i.minPlates) + " طبق" : "—"}</td><td class="n">${nf(ss.get(i.id)?.closing || 0)} طبق</td><td>${i.active === false ? pill(["موقوف"]) : pill(["نشط", "good"])}</td><td class="nowrap"><button class="btn sm" data-act="edit-item" data-id="${i.id}">تعديل</button></td></tr>`).join("") : emptyRow(7, "أضف أصناف المزرعة مع وزن أو عدد الطبق الواحد وسعره.")}
   </tbody></table></div><p class="small muted">بعد إضافة الصنف، سجّل الموجود حالياً في الغرفة من «المخزون ← رصيد افتتاحي».</p></section>
-  <section class="panel"><div class="panel-head"><h2>العمال</h2><button class="btn primary" data-act="new-worker">+ عامل</button></div>
-  <p class="small muted">أسماء العمال تظهر في خانة «العامل المسؤول» عند تسجيل الإنتاج والسحب والأوردرات والمصروفات. حسابات دخول العمال تأتي مع النسخة الأونلاين.</p>
-  <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الاسم</th><th>التليفون</th><th>الحالة</th><th></th></tr></thead><tbody>
-  ${workers(true).length ? workers(true).map(w => `<tr><td><b>${esc(w.name)}</b></td><td dir="ltr" style="text-align:start">${esc(w.phone || "—")}</td><td>${w.active === false ? pill(["موقوف"]) : pill(["نشط", "good"])}</td><td class="nowrap"><button class="btn sm" data-act="edit-worker" data-id="${w.id}">تعديل</button> <button class="btn sm" data-act="worker-log" data-id="${w.id}">حركاته</button></td></tr>`).join("") : emptyRow(4, "لم تضف عمالاً بعد. أضفهم لو عايز تسجل مين المسؤول عن كل عملية.")}
+  <section class="panel"><div class="panel-head"><h2>العمال والموظفين</h2><button class="btn primary" data-act="new-worker">+ موظف</button></div>
+  <p class="small muted">أسماء العمال تظهر في خانة «العامل المسؤول» عند التسجيل. المرتبات والسلف والخصومات من صفحة «المرتبات».</p>
+  <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الاسم</th><th>التليفون</th><th class="n">المرتب</th><th>الحالة</th><th></th></tr></thead><tbody>
+  ${workers(true).length ? workers(true).map(w => `<tr><td><b>${esc(w.name)}</b></td><td dir="ltr" style="text-align:start">${esc(w.phone || "—")}</td><td class="n">${onPayroll(w) ? money(salaryFor(w, curMonth())) : "—"}</td><td>${w.active === false ? pill(["موقوف"]) : pill(["نشط", "good"])}</td><td class="nowrap"><button class="btn sm" data-act="edit-worker" data-id="${w.id}">تعديل</button> <button class="btn sm" data-act="worker-log" data-id="${w.id}">حركاته</button></td></tr>`).join("") : emptyRow(5, "لم تضف موظفين بعد.")}
   </tbody></table></div></section>
   <div class="grid2">
-  <section class="panel"><h2>بيانات المزرعة</h2><form id="set-form" class="form">${field("اسم المزرعة", `<input type="text" name="farmName" id="set-farm" value="${esc(s.farmName || "")}">`)}${field("اسمك", `<input type="text" name="ownerName" id="set-owner" value="${esc(s.ownerName || "")}">`)}${field("العملة", `<input type="text" name="currency" id="set-cur" value="${esc(s.currency || "")}">`)}<div class="f full"><button class="btn primary" type="submit" style="align-self:flex-start">حفظ</button></div></form></section>
-  <section class="panel"><h2>البيانات والنسخ الاحتياطي</h2><p class="small muted">كل البيانات محفوظة على هذا الموبايل فقط. آخر نسخة احتياطية: <b>${s.lastBackup ? fmtDT(s.lastBackup) : "لم تُعمل بعد"}</b></p>
-  <div class="actions"><button class="btn primary" data-act="backup">نسخة احتياطية / استرجاع</button><button class="btn danger" data-act="reset">مسح كل البيانات</button></div></section></div>
-  <p class="small muted">Pets Home — نسخة محلية تجريبية (${APP_VERSION})</p>`;
+  <section class="panel"><h2>بيانات المزرعة</h2><form id="set-form" class="form">${field("اسم المزرعة", `<input type="text" name="farmName" id="set-farm" value="${esc(s.farmName || "")}">`)}${field("اسمك", `<input type="text" name="ownerName" id="set-owner" value="${esc(s.ownerName || "")}">`)}<div class="f full"><button class="btn primary" type="submit" style="align-self:flex-start">حفظ</button></div></form></section>
+  <section class="panel"><h2>البيانات والنسخ الاحتياطي</h2><p class="small muted">${MODE === "cloud" ? `البيانات محفوظة على السحابة في حساب <b dir="ltr">${esc(accountName())}</b> ومتزامنة مع كل الأجهزة.` : "كل البيانات محفوظة على هذا الموبايل فقط."} آخر نسخة احتياطية: <b>${s.lastBackup ? fmtDT(s.lastBackup) : "لم تُعمل بعد"}</b></p>
+  <div class="actions">${MODE === "cloud" ? `<button class="btn" data-act="account">حسابي</button>` : ""}<button class="btn primary" data-act="backup">نسخة احتياطية / استرجاع</button><button class="btn danger" data-act="reset">مسح كل البيانات</button></div></section></div>
+  <p class="small muted">Pets Home — ${MODE === "cloud" ? "نسخة السحابة" : "نسخة محلية"} (${APP_VERSION})</p>`;
 };
 afterRender.admin = () => {
   $("#set-form").onsubmit = e => {
     e.preventDefault(); const fd = new FormData(e.target); const before = settings();
-    const next = Object.assign({}, before, { farmName: fv(fd, "farmName") || "Pets Home", ownerName: fv(fd, "ownerName") || before.ownerName || "المدير", currency: fv(fd, "currency") || "ج.م" }); delete next.id;
+    const next = Object.assign({}, before, { farmName: fv(fd, "farmName") || "Pets Home", ownerName: fv(fd, "ownerName") || before.ownerName || "المدير" }); delete next.id;
     Store.put("meta", "settings", next); audit("تعديل", "settings", "settings", "تعديل بيانات المزرعة", before, next); document.activeElement?.blur(); toast("تم الحفظ");
   };
 };
@@ -1239,19 +1364,225 @@ function itemForm(existing) {
 }
 function workerForm(existing) {
   const w = existing || { active: true };
-  openModal(existing ? `تعديل ${w.name}` : "عامل جديد", `<div class="form">
+  const months = [prevMonth(prevMonth(curMonth())), prevMonth(curMonth()), curMonth(), nextMonth(curMonth())];
+  const sal = existing && onPayroll(existing) ? salaryFor(existing, curMonth()) : null;
+  openModal(existing ? `تعديل ${w.name}` : "موظف جديد", `<div class="form">
     ${field("الاسم", `<input type="text" name="name" id="f-name" value="${esc(w.name || "")}" required>`)}
     ${field("التليفون", `<input type="tel" name="phone" id="f-phone" dir="ltr" value="${esc(w.phone || "")}">`)}
-    <label class="check f full"><input type="checkbox" name="active" id="f-active" ${w.active !== false ? "checked" : ""}> يظهر في قائمة «العامل المسؤول»</label></div>`, {
+    ${existing ? `<div class="f full"><span class="small muted" style="font-weight:600">المرتب الشهري</span><div class="actions" style="align-items:center"><b class="num">${sal != null ? money(sal) : "لم يُحدد"}</b><button type="button" class="btn sm" data-act="salary" data-id="${w.id}">${sal != null ? "زيادة / تغيير المرتب" : "تحديد المرتب"}</button></div></div>`
+      : `${field("المرتب الشهري", numInput("salary", ""), "", "اتركه فاضي لو العامل مش على المرتبات")}
+         ${field("المرتب يبدأ من شهر", `<select name="startMonth" id="f-startMonth">${months.map(m => opt(m, monthLabel(m), curMonth())).join("")}</select>`)}`}
+    <label class="check f full"><input type="checkbox" name="active" id="f-active" ${w.active !== false ? "checked" : ""}> نشط (يظهر في القوائم ويستحق مرتب)</label></div>`, {
     done: "تم الحفظ",
     onSubmit: async fd => {
-      const name = fv(fd, "name"); if (!name) return "اكتب اسم العامل.";
+      const name = fv(fd, "name"); if (!name) return "اكتب اسم الموظف.";
       const data = { name, phone: fv(fd, "phone"), active: fd.get("active") === "on" };
-      if (existing) { const next = Object.assign({}, existing, data); await Store.put("workers", existing.id, next); audit("تعديل", "worker", existing.id, `تعديل بيانات العامل ${name}`, existing, next); }
-      else { const id = Store.newId(); await Store.put("workers", id, Object.assign(data, { at: nowISO() })); audit("إضافة", "worker", id, `إضافة عامل ${name}`); }
+      if (existing) {
+        const next = Object.assign({}, existing, data);
+        if (onPayroll(existing)) { if (!data.active && existing.active !== false && !existing.endMonth) next.endMonth = curMonth(); if (data.active) delete next.endMonth; }
+        await Store.put("workers", existing.id, next); audit("تعديل", "worker", existing.id, `تعديل بيانات ${name}`, existing, next);
+      } else {
+        const salary = fnum(fd, "salary");
+        if (fv(fd, "salary") && (!isFinite(salary) || salary < 0)) return "اكتب المرتب بالأرقام.";
+        if (isFinite(salary) && salary > 0) { const from = fv(fd, "startMonth") || curMonth(); Object.assign(data, { salary: r2(salary), startMonth: from, salaryHistory: [{ from, amount: r2(salary), at: nowISO() }] }); }
+        const id = Store.newId(); await Store.put("workers", id, Object.assign(data, { at: nowISO() }));
+        audit("إضافة", "worker", id, `إضافة موظف ${name}${data.salary ? ` بمرتب ${money(data.salary)} من ${monthLabel(data.startMonth)}` : ""}`);
+      }
     }
   });
 }
+
+/* ================== Payroll ==================
+   Each employee has a monthly salary (with its history, so raises apply from a chosen month).
+   Through the month the manager records cash advances, deductions, absences and bonuses; the app works out
+   what is still owed. Whatever is left over (or overdrawn) carries into the next month automatically.
+   Cash advances and salary payments count as expenses ("مرتبات") on the day the money is paid. */
+const PAY_TYPES = {
+  advance: { label: "سلفة / سحب نقدي", short: "سلفة", sign: -1, cls: "warn", cash: true },
+  deduct:  { label: "خصم / جزاء", short: "خصم", sign: -1, cls: "bad" },
+  absence: { label: "غياب", short: "غياب", sign: -1, cls: "bad" },
+  bonus:   { label: "مكافأة / حافز", short: "مكافأة", sign: 1, cls: "good" },
+  payout:  { label: "صرف مرتب", short: "صرف", sign: -1, cls: "acc", cash: true }
+};
+const nextMonth = ym => { const [y, m] = ym.split("-").map(Number); return m === 12 ? `${y + 1}-01` : `${y}-${pad(m + 1)}`; };
+const salaryHist = w => !w ? [] : (Array.isArray(w.salaryHistory) && w.salaryHistory.length ? w.salaryHistory : (+w.salary ? [{ from: w.startMonth || curMonth(), amount: +w.salary }] : []));
+const onPayroll = w => salaryHist(w).length > 0;
+function salaryFor(w, ym) {
+  const h = salaryHist(w).slice().sort((a, b) => a.from < b.from ? -1 : 1);
+  if (!h.length || ym < h[0].from || (w.endMonth && ym > w.endMonth)) return 0;
+  let amt = 0; h.forEach(x => { if (x.from <= ym) amt = +x.amount || 0; }); return amt;
+}
+const peMonth = p => String(p.date || "").slice(0, 7);
+function payLedger(empId) {
+  return memo("pl:" + empId, () => {
+    const w = S.workers.get(empId);
+    const entries = [...S.payroll.values()].filter(p => p.empId === empId).sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.at || "") < (b.at || "") ? -1 : 1);
+    const starts = salaryHist(w).map(x => x.from).concat(entries.map(peMonth)).filter(Boolean).sort();
+    const start = starts[0] || curMonth(), end = [curMonth(), ...entries.map(peMonth)].sort().pop();
+    const rows = new Map(); let carry = 0;
+    for (let m = start, i = 0; m <= end && i < 600; m = nextMonth(m), i++) {
+      const r = { ym: m, carry: r2(carry), base: salaryFor(w, m), advance: 0, deduct: 0, absence: 0, bonus: 0, payout: 0, entries: [] };
+      entries.forEach(p => { if (peMonth(p) === m) { if (r[p.type] != null) r[p.type] += +p.amount || 0; r.entries.push(p); } });
+      ["advance", "deduct", "absence", "bonus", "payout"].forEach(k => r[k] = r2(r[k]));
+      r.earned = r2(r.base + r.bonus - r.deduct - r.absence);
+      r.due = r2(r.carry + r.earned - r.advance - r.payout);
+      rows.set(m, r); carry = r.due;
+    }
+    return rows;
+  });
+}
+function payRow(empId, ym) {
+  const L = payLedger(empId), r = L.get(ym); if (r) return r;
+  const keys = [...L.keys()], last = keys.length && ym > keys[keys.length - 1] ? L.get(keys[keys.length - 1]).due : 0;
+  return { ym, carry: last, base: 0, advance: 0, deduct: 0, absence: 0, bonus: 0, payout: 0, entries: [], earned: 0, due: last };
+}
+function payrollMonth(ym) {
+  return memo("pm:" + ym, () => {
+    const t = { base: 0, advance: 0, deduct: 0, absence: 0, bonus: 0, payout: 0, remaining: 0, over: 0, people: 0 };
+    workers(true).forEach(w => {
+      const r = payRow(w.id, ym); if (!r.base && !r.entries.length && !r.carry) return;
+      t.people++; ["base", "advance", "deduct", "absence", "bonus", "payout"].forEach(k => t[k] += r[k]);
+      if (r.due > 0) t.remaining += r.due; else t.over += -r.due;
+    });
+    Object.keys(t).forEach(k => t[k] = r2(t[k])); return t;
+  });
+}
+const payrollCashRows = () => memo("pcr", () => [...S.payroll.values()].filter(p => PAY_TYPES[p.type] && PAY_TYPES[p.type].cash).map(p => ({
+  id: "pe-" + p.id, _pe: true, kind: "expense", category: "مرتبات", amount: +p.amount || 0, date: p.date, at: p.at, payType: "cash",
+  note: `${PAY_TYPES[p.type].short} — ${wName(p.empId)}${p.note ? " — " + p.note : ""}`, by: p.by })));
+const dueLabel = d => d > 0.005 ? pill(["متبقي له", "warn"]) : d < -0.005 ? pill(["عليه (يتخصم)", "bad"]) : pill(["تم الصرف", "good"]);
+
+let payMonth = curMonth();
+VIEWS.payroll = () => {
+  if (payMonth > curMonth()) payMonth = curMonth();
+  const ym = payMonth, T = payrollMonth(ym);
+  const emps = workers(true).filter(w => { const r = payRow(w.id, ym); return (onPayroll(w) && w.active !== false) || r.base || r.entries.length || Math.abs(r.due) > 0.005; });
+  const noSalary = workers().filter(w => !onPayroll(w));
+  const cell = (v, sign) => v ? sgn(sign + nf(v)) : "—";
+  return `${headHtml("المرتبات", `شهر ${monthLabel(ym)}${ym === curMonth() ? " (الحالي)" : ""}`, `<button class="btn primary" data-act="pe-new" data-id="advance">+ سلفة</button><button class="btn" data-act="pe-new" data-id="deduct">+ خصم / مكافأة</button><button class="btn" data-act="pe-new" data-id="payout">صرف مرتب</button>`)}
+  <div class="monthnav"><button type="button" class="btn sm" data-act="pay-month" data-id="${prevMonth(ym)}">الشهر السابق</button><b>${monthLabel(ym)}</b>${ym < curMonth() ? `<button type="button" class="btn sm" data-act="pay-month" data-id="${nextMonth(ym)}">الشهر التالي</button>` : `<span class="btn sm" style="visibility:hidden">الشهر التالي</span>`}</div>
+  <section class="kpis" aria-label="ملخص المرتبات">
+    <div class="kpi hero"><span>المتبقي للصرف</span><b class="num">${money(T.remaining)}</b><small>تم صرف ${money(T.payout)}</small></div>
+    <div class="kpi"><span>إجمالي المرتبات</span><b class="num">${money(T.base)}</b><small>${T.people} موظف</small></div>
+    <div class="kpi"><span>سلف ومسحوبات</span><b class="num">${money(T.advance)}</b><small>تُخصم من المرتب</small></div>
+    <div class="kpi"><span>خصومات وغياب</span><b class="num">${money(r2(T.deduct + T.absence))}</b><small>مكافآت ${sgn("+" + nf(T.bonus))}</small></div>
+  </section>
+  <section class="panel"><div class="panel-head"><h2>الموظفين</h2><button class="btn sm" data-act="new-worker">+ موظف</button></div>
+  <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الموظف</th><th class="n">المرتب</th><th class="n">مرحّل</th><th class="n">مكافآت</th><th class="n">خصومات وغياب</th><th class="n">سلف</th><th class="n">مصروف</th><th class="n">المتبقي</th><th></th></tr></thead><tbody>
+  ${emps.length ? emps.map(w => { const r = payRow(w.id, ym); return `<tr><td><b>${esc(w.name)}</b>${w.active === false ? ` ${pill(["موقوف"])}` : ""}</td><td class="n">${nf(r.base)}</td><td class="n">${r.carry ? sgn((r.carry > 0 ? "+" : "−") + nf(Math.abs(r.carry))) : "—"}</td><td class="n pos">${cell(r.bonus, "+")}</td><td class="n neg">${cell(r2(r.deduct + r.absence), "−")}</td><td class="n neg">${cell(r.advance, "−")}</td><td class="n">${cell(r.payout, "−")}</td><td class="n"><b class="num">${nf(Math.abs(r.due))}</b> ${dueLabel(r.due)}</td>
+    <td class="nowrap"><button class="btn sm" data-act="pe-new" data-id="advance" data-emp="${w.id}">سلفة</button> <button class="btn sm" data-act="pe-new" data-id="deduct" data-emp="${w.id}">خصم</button> <button class="btn sm" data-act="pe-new" data-id="bonus" data-emp="${w.id}">مكافأة</button> <button class="btn sm" data-act="pe-new" data-id="payout" data-emp="${w.id}">صرف</button> <button class="btn sm" data-act="emp-st" data-id="${w.id}">الكشف</button></td></tr>`; }).join("")
+    : emptyRow(9, "لا يوجد موظفين على المرتبات. اضغط «+ موظف» وحدد المرتب الشهري.")}
+  </tbody></table></div>
+  ${noSalary.length ? `<p class="small muted">بدون مرتب محدد: ${noSalary.map(w => `${esc(w.name)} <button type="button" class="linkbtn" data-act="salary" data-id="${w.id}">حدد المرتب</button>`).join(" · ")}</p>` : ""}
+  <p class="small muted">المتبقي = المرحّل من الشهر اللي فات + المرتب + المكافآت − الخصومات والغياب − السلف − المصروف. أي باقي أو زيادة بيترحّل للشهر اللي بعده تلقائياً. السلف والمرتبات المصروفة بتتحسب في المصروفات تحت بند «مرتبات».</p></section>`;
+};
+
+function payEntryForm(type, empId, existing) {
+  const emps = workers().filter(onPayroll);
+  if (existing && !emps.some(w => w.id === existing.empId) && S.workers.get(existing.empId)) emps.push(S.workers.get(existing.empId));
+  if (!emps.length) { toast("أضف موظف بمرتب أولاً من «المرتبات ← + موظف»."); go("payroll"); return; }
+  const p = existing || { type: type || "advance", empId: emps.some(w => w.id === empId) ? empId : emps[0].id, date: today() };
+  const form = openModal(existing ? "تعديل حركة مرتبات" : (PAY_TYPES[p.type] || PAY_TYPES.advance).label, `<div class="form">
+    ${field("الموظف", `<select name="empId" id="f-empId">${emps.map(w => opt(w.id, w.name, p.empId)).join("")}</select>`)}
+    ${field("النوع", `<select name="type" id="f-type">${Object.entries(PAY_TYPES).map(([k, v]) => opt(k, v.label, p.type)).join("")}</select>`)}
+    <label class="f" id="pe-days"><span>عدد أيام الغياب</span>${numInput("days", p.days)}<small>المبلغ = مرتب اليوم × عدد الأيام (المرتب ÷ 30)</small></label>
+    ${field("المبلغ", numInput("amount", p.amount, "required"))}
+    ${field("التاريخ", dateInput("date", p.date))}
+    ${field("ملاحظة", `<input type="text" name="note" id="f-note" value="${esc(p.note || "")}" placeholder="مثال: سلفة نقدي">`)}
+    <div class="f full"><div class="sum-box" id="pe-sum"></div></div></div>`, {
+    submitLabel: existing ? "حفظ التعديل" : "تسجيل", done: existing ? "تم حفظ التعديل" : "تم التسجيل",
+    onSubmit: async fd => {
+      const t = fv(fd, "type"), amount = fnum(fd, "amount"), emp = fv(fd, "empId");
+      if (!PAY_TYPES[t]) return "اختر النوع.";
+      if (!isFinite(amount) || amount <= 0) return "اكتب مبلغ أكبر من صفر.";
+      const data = { empId: emp, type: t, amount: r2(amount), date: fv(fd, "date") || today(), note: fv(fd, "note"), by: OWNER_ID };
+      if (t === "absence") { const dd = fnum(fd, "days"); if (isFinite(dd) && dd > 0) data.days = r2(dd); }
+      const sum = `${PAY_TYPES[t].short} ${money(data.amount)} — ${wName(emp)}${data.days ? ` (${nf(data.days)} يوم)` : ""}${data.note ? " — " + data.note : ""}`;
+      if (existing) { const next = Object.assign({}, existing, data, { editedAt: nowISO() }); if (t !== "absence") delete next.days; await Store.put("payroll", existing.id, next); audit("تعديل", "payroll", existing.id, "تعديل " + sum, existing, next); }
+      else { const id = Store.newId(); await Store.put("payroll", id, Object.assign(data, { at: nowISO() })); audit("إضافة", "payroll", id, sum); }
+    }
+  });
+  const $f = n => form.querySelector(`[name=${n}]`);
+  let amountTouched = !!existing;
+  $f("amount").addEventListener("input", () => amountTouched = true);
+  const upd = () => {
+    const t = $f("type").value, emp = $f("empId").value, w = S.workers.get(emp), date = $f("date").value || today(), ym = date.slice(0, 7);
+    $("#pe-days").hidden = t !== "absence";
+    $("#m-title").textContent = existing ? "تعديل حركة مرتبات" : PAY_TYPES[t].label;
+    const r = payRow(emp, ym);
+    let before = r.due; if (existing && existing.empId === emp && peMonth(existing) === ym) before = r2(before + (existing.type === "bonus" ? -existing.amount : +existing.amount));
+    if (!amountTouched) {
+      if (t === "absence") { const dd = pnum($f("days").value); $f("amount").value = isFinite(dd) && dd > 0 ? r2(salaryFor(w, ym) / 30 * dd) : ""; }
+      else if (t === "payout") $f("amount").value = before > 0 ? before : "";
+      else $f("amount").value = "";
+    }
+    const a = pnum($f("amount").value) || 0, after = r2(before + (t === "bonus" ? a : -a));
+    $("#pe-sum").innerHTML = `<div class="small"><span>المرتب الشهري</span><span class="num">${money(salaryFor(w, ym))}</span></div>
+      <div><span>المتبقي له في ${MONTHS[+ym.slice(5, 7) - 1]} قبل التسجيل</span><b class="num">${money(before)}</b></div>
+      <div class="big"><span>بعد التسجيل</span><b class="num ${after < 0 ? "neg" : ""}">${money(after)}</b></div>`;
+  };
+  ["type", "empId", "date"].forEach(n => $f(n).addEventListener("change", () => { if (n !== "date") amountTouched = !!existing && n === "empId" ? amountTouched : false; upd(); }));
+  $f("days").addEventListener("input", () => { amountTouched = false; upd(); });
+  $f("amount").addEventListener("input", upd);
+  upd();
+}
+function salaryForm(empId) {
+  const w = S.workers.get(empId); if (!w) return;
+  const curSal = salaryFor(w, curMonth()), had = onPayroll(w);
+  const months = [prevMonth(prevMonth(curMonth())), prevMonth(curMonth()), curMonth(), nextMonth(curMonth())];
+  openModal(had ? `زيادة / تغيير مرتب ${w.name}` : `تحديد مرتب ${w.name}`, `<div class="form">
+    ${had ? `<div class="f full"><div class="sum-box"><div><span>المرتب الحالي</span><b class="num">${money(curSal)}</b></div></div></div>` : ""}
+    ${field("المرتب الشهري الجديد", numInput("amount", had ? curSal : "", "required"))}
+    ${field("يبدأ من شهر", `<select name="from" id="f-from">${months.map(m => opt(m, monthLabel(m), curMonth())).join("")}</select>`, "", "الشهور اللي قبله بتفضل بالمرتب القديم")}</div>`, {
+    submitLabel: "حفظ المرتب", done: "تم حفظ المرتب",
+    onSubmit: async fd => {
+      const amount = fnum(fd, "amount"), from = fv(fd, "from") || curMonth();
+      if (!isFinite(amount) || amount < 0) return "اكتب المرتب بالأرقام.";
+      const hist = salaryHist(w).filter(x => x.from !== from).concat([{ from, amount: r2(amount), at: nowISO() }]).sort((a, b) => a.from < b.from ? -1 : 1);
+      const next = Object.assign({}, w, { salaryHistory: hist, startMonth: w.startMonth && w.startMonth < hist[0].from ? w.startMonth : hist[0].from });
+      next.salary = salaryFor(next, curMonth()) || r2(amount);
+      await Store.put("workers", w.id, next);
+      audit("تعديل", "worker", w.id, had ? `${amount > curSal ? "زيادة" : "تغيير"} مرتب ${w.name}: ${money(curSal)} ← ${money(amount)} من ${monthLabel(from)}` : `تحديد مرتب ${w.name}: ${money(amount)} من ${monthLabel(from)}`);
+    }
+  });
+}
+function empStatementText(empId, ym) {
+  const w = S.workers.get(empId), r = payRow(empId, ym);
+  return [`${settings().farmName || "Pets Home"} — كشف مرتب ${w ? w.name : ""} — ${monthLabel(ym)}`, "—".repeat(14),
+    r.carry ? `مرحّل من الشهر اللي فات: ${r.carry > 0 ? "+" : "−"}${money(Math.abs(r.carry))}` : null,
+    `المرتب: ${money(r.base)}`, r.bonus ? `+ مكافآت: ${money(r.bonus)}` : null, r.deduct ? `− خصومات: ${money(r.deduct)}` : null,
+    r.absence ? `− غياب: ${money(r.absence)}` : null, r.advance ? `− سلف: ${money(r.advance)}` : null, r.payout ? `− تم صرفه: ${money(r.payout)}` : null,
+    "—".repeat(14), r.due >= 0 ? `المتبقي له: ${money(r.due)}` : `عليه للشهر الجاي: ${money(-r.due)}`,
+    ...r.entries.map(p => `• ${fmtDate(p.date)} ${PAY_TYPES[p.type] ? PAY_TYPES[p.type].short : p.type} ${money(p.amount)}${p.note ? " — " + p.note : ""}`)].filter(Boolean).join("\n");
+}
+function empStatement(empId, ym) {
+  const w = S.workers.get(empId); if (!w) return; ym = ym || payMonth;
+  const r = payRow(empId, ym), hist = [...payLedger(empId).values()].reverse().slice(0, 12);
+  openModal(`كشف مرتب ${w.name}`, `<div class="stack">
+    <div class="monthnav"><button type="button" class="btn sm" data-act="emp-st" data-id="${empId}" data-month="${prevMonth(ym)}">الشهر السابق</button><b>${monthLabel(ym)}</b>${ym < curMonth() ? `<button type="button" class="btn sm" data-act="emp-st" data-id="${empId}" data-month="${nextMonth(ym)}">الشهر التالي</button>` : `<span class="btn sm" style="visibility:hidden">الشهر التالي</span>`}</div>
+    <div class="sum-box">
+      ${r.carry ? `<div class="small"><span>${r.carry > 0 ? "باقي له من الشهر اللي فات" : "عليه من الشهر اللي فات"}</span><span class="num">${money(Math.abs(r.carry))}</span></div>` : ""}
+      <div><span>المرتب الأساسي</span><b class="num">${money(r.base)}</b></div>
+      ${r.bonus ? `<div class="small"><span>+ مكافآت</span><span class="num pos">${money(r.bonus)}</span></div>` : ""}
+      ${r.deduct ? `<div class="small"><span>− خصومات</span><span class="num neg">${money(r.deduct)}</span></div>` : ""}
+      ${r.absence ? `<div class="small"><span>− غياب</span><span class="num neg">${money(r.absence)}</span></div>` : ""}
+      ${r.advance ? `<div class="small"><span>− سلف ومسحوبات</span><span class="num neg">${money(r.advance)}</span></div>` : ""}
+      ${r.payout ? `<div class="small"><span>− تم صرفه</span><span class="num">${money(r.payout)}</span></div>` : ""}
+      <div class="big"><span>${r.due >= 0 ? "المتبقي له" : "عليه (يتخصم الشهر الجاي)"}</span><b class="num ${r.due < 0 ? "neg" : ""}">${money(Math.abs(r.due))}</b></div></div>
+    <h3>حركات الشهر</h3><div class="tbl-wrap"><table class="rtable"><thead><tr><th>النوع</th><th>التاريخ</th><th class="n">المبلغ</th><th>ملاحظة</th><th></th></tr></thead><tbody>
+    ${r.entries.length ? r.entries.map(p => `<tr><td>${pill([PAY_TYPES[p.type] ? PAY_TYPES[p.type].label : p.type, PAY_TYPES[p.type] ? PAY_TYPES[p.type].cls : ""])}${p.days ? ` <span class="small muted">${nf(p.days)} يوم</span>` : ""}</td><td class="nowrap">${fmtDate(p.date)}</td><td class="n ${p.type === "bonus" ? "pos" : "neg"}">${sgn((p.type === "bonus" ? "+" : "−") + nf(p.amount))}</td><td class="small">${esc(p.note || "") || "—"}</td><td class="nowrap">${rowActions("pe", p.id)}</td></tr>`).join("") : emptyRow(5, "لا توجد حركات في هذا الشهر.")}
+    </tbody></table></div>
+    <h3>آخر الشهور</h3><div class="tbl-wrap"><table class="rtable"><thead><tr><th>الشهر</th><th class="n">المرتب</th><th class="n">المستحق</th><th class="n">سلف + مصروف</th><th class="n">المتبقي</th></tr></thead><tbody>
+    ${hist.map(h => `<tr><td>${monthLabel(h.ym)}</td><td class="n">${nf(h.base)}</td><td class="n">${nf(h.earned)}</td><td class="n">${nf(r2(h.advance + h.payout))}</td><td class="n"><b>${nf(h.due)}</b></td></tr>`).join("")}
+    </tbody></table></div>
+    <p class="small muted">تاريخ المرتب: ${salaryHist(w).slice().sort((a, b) => a.from < b.from ? -1 : 1).map(x => `${money(x.amount)} من ${monthLabel(x.from)}`).join(" ← ") || "لم يُحدد"}</p></div>`, {
+    wide: true, noFocus: true,
+    extra: `<button type="button" class="btn primary" data-act="pe-new" data-id="payout" data-emp="${empId}">صرف المرتب</button><button type="button" class="btn" data-act="pe-new" data-id="advance" data-emp="${empId}">سلفة</button><button type="button" class="btn" data-act="salary" data-id="${empId}">تغيير المرتب</button><button type="button" class="btn" id="emp-share">${navigator.share ? "مشاركة الكشف" : "نسخ الكشف"}</button>`
+  });
+  labelTables($("#modal-root"));
+  $("#emp-share").onclick = () => shareOrCopy("كشف مرتب", empStatementText(empId, ym), "تم نسخ الكشف");
+}
+
 const recordCount = () => COLS.filter(c => c !== "meta" && c !== "audit").reduce((a, c) => a + S[c].size, 0);
 function backupData() {
   const o = { app: "petshome", version: 3, edition: "local", exportedAt: nowISO(), data: {} };
@@ -1265,7 +1596,7 @@ function backupSheet() {
   const file = () => new File([JSON.stringify(backupData())], backupName(), { type: "application/json" });
   let canShareFile = false; try { canShareFile = !!(navigator.canShare && navigator.canShare({ files: [file()] })); } catch {}
   openModal("نسخة احتياطية", `<div class="stack">
-    <p>كل بيانات المزرعة محفوظة على هذا الموبايل فقط. لو اتمسح التطبيق أو ضاع الموبايل، النسخة الاحتياطية هي اللي بترجّع البيانات.</p>
+    <p>${MODE === "cloud" ? "البيانات محفوظة على السحابة. النسخة الاحتياطية ملف إضافي للاحتياط تحتفظ بيه معاك." : "كل بيانات المزرعة محفوظة على هذا الموبايل فقط. لو اتمسح التطبيق أو ضاع الموبايل، النسخة الاحتياطية هي اللي بترجّع البيانات."}</p>
     <div class="sum-box"><div><span>آخر نسخة احتياطية</span><b>${s.lastBackup ? fmtDT(s.lastBackup) : "لم تُعمل بعد"}</b></div><div><span>عدد السجلات</span><b>${nf(recordCount(), 0)}</b></div></div>
     <p class="small muted">احفظ النسخة في Google Drive أو ابعتها لنفسك على واتساب مرة في الأسبوع على الأقل. نفس الملف ده هو اللي هينقل بياناتك للنسخة الأونلاين بعدين.</p>
     <div class="actions">${canShareFile ? `<button type="button" class="btn primary" id="bk-share">حفظ في Drive / واتساب</button>` : ""}<button type="button" class="btn ${canShareFile ? "" : "primary"}" id="bk-dl">تنزيل الملف</button>
@@ -1288,7 +1619,7 @@ async function restoreSnapshot() {
     submitLabel: "استرجاع", noFocus: true,
     onSubmit: async () => {
       await Local.snapshot("قبل استرجاع النسخة التلقائية");
-      COLS.forEach(c => { S[c] = toMap(snap.data[c]); Local.mark(c); }); ver++;
+      Store.bulk(replaceOps(snap.data)); mergeAudit(snap.data.audit);
       audit("استرجاع", "snapshot", "", `استرجاع النسخة التلقائية (${snap.info.reason})`);
       await Local.flush(); toast("تم الاسترجاع");
     }
@@ -1301,14 +1632,8 @@ function importBackup(text, fresh) {
   const n = cols.filter(c => c !== "meta" && c !== "audit").reduce((a, c) => a + Object.keys(o.data[c] || {}).length, 0);
   const apply = async replace => {
     if (replace && recordCount() > 0) await Local.snapshot("قبل استرجاع نسخة احتياطية");
-    cols.forEach(c => {
-      const m = replace ? new Map() : new Map(S[c]);
-      Object.entries(o.data[c] || {}).forEach(([id, v]) => m.set(id, Object.assign({}, v, { id })));
-      S[c] = m; Local.mark(c);
-    });
-    if (replace) COLS.filter(c => !cols.includes(c)).forEach(c => { S[c] = new Map(); Local.mark(c); });
-    ver++;
-    if (!S.meta.get("settings")) Store.put("meta", "settings", { farmName: "Pets Home", ownerName: "المدير", currency: "ج.م", createdAt: nowISO() });
+    Store.bulk(replaceOps(o.data, !replace)); mergeAudit(o.data.audit);
+    if (!S.meta.get("settings")) Store.put("meta", "settings", { farmName: "Pets Home", ownerName: "المدير", createdAt: nowISO() });
     audit("استرجاع", "backup", "", `استرجاع نسخة احتياطية بتاريخ ${fmtDT(o.exportedAt)} (${n} سجل)${replace ? " — استبدال كامل" : " — دمج"}`);
     Local.flush(); closeModal(); toast("تم الاسترجاع"); render();
   };
@@ -1317,14 +1642,118 @@ function importBackup(text, fresh) {
     { noFocus: true, extra: `<button type="button" class="btn danger" id="imp-replace">استبدال كل البيانات</button><button type="button" class="btn" id="imp-merge">دمج</button>` });
   $("#imp-replace").onclick = () => apply(true); $("#imp-merge").onclick = () => apply(false);
 }
+/* Writes needed to make the data equal `data` (or, with merge, to add what's missing). The audit log is history: it is only ever added to. */
+function replaceOps(data, merge) {
+  const ops = [];
+  for (const c of COLS) {
+    if (c === "audit") continue;
+    const incoming = data[c] || {};
+    if (!merge) for (const id of S[c].keys()) if (!(id in incoming) && !(c === "meta" && id === "app")) ops.push({ op: "del", col: c, id });
+    for (const [id, v] of Object.entries(incoming)) {
+      const cur = S[c].get(id);
+      if (!cur || JSON.stringify(fromMap(new Map([[id, cur]]))[id]) !== JSON.stringify(v)) ops.push({ op: "put", col: c, id, data: v });
+    }
+  }
+  return ops;
+}
+function mergeAudit(auditData) {
+  Object.entries(auditData || {}).forEach(([id, d]) => {
+    const entries = (d && d.entries) || []; if (!entries.length) return;
+    const date = (d && d.date) || id.slice(0, 10);
+    if (MODE === "cloud") { B.appendAuditMany(id, { date }, entries).catch(e => console.error("audit merge", e)); return; }
+    const cur = S.audit.get(id), have = new Set((cur ? cur.entries || [] : []).map(e => e.at + "|" + e.summary));
+    const add = entries.filter(e => !have.has(e.at + "|" + e.summary));
+    if (add.length) Store.put("audit", id, { date, entries: (cur ? cur.entries || [] : []).concat(add) });
+  });
+}
 function resetAll() {
-  openModal("مسح كل البيانات", `<p>هيتم مسح كل الأصناف والأوردرات والمصروفات والعملاء والسجل من هذا الموبايل نهائياً.</p><p class="small muted">لو محتاج البيانات دي بعدين، اعمل نسخة احتياطية الأول.</p><div class="form">${field("للتأكيد اكتب: مسح", `<input type="text" name="confirm" id="f-confirm" autocomplete="off">`, "full")}</div>`, {
+  openModal("مسح كل البيانات", `<p>هيتم مسح كل الأصناف والأوردرات والمصروفات والعملاء والمرتبات ${MODE === "cloud" ? "من الحساب على كل الأجهزة" : "من هذا الموبايل"}. سجل العمليات بيفضل زي ما هو.</p><p class="small muted">لو محتاج البيانات دي بعدين، اعمل نسخة احتياطية الأول.</p><div class="form">${field("للتأكيد اكتب: مسح", `<input type="text" name="confirm" id="f-confirm" autocomplete="off">`, "full")}</div>`, {
     danger: true, submitLabel: "مسح نهائي", noFocus: true,
     onSubmit: async fd => {
       if (fv(fd, "confirm") !== "مسح") return "اكتب كلمة «مسح» للتأكيد.";
       await Local.snapshot("قبل مسح كل البيانات");
-      COLS.forEach(c => { S[c] = new Map(); Local.mark(c); }); ver++; await Local.flush();
+      Store.bulk(replaceOps({})); await Local.flush();
       route = "dashboard"; lsSet("petshome:lastBy", null);
+    }
+  });
+}
+
+/* ================== Cloud: sign-in, account, moving phone data up ================== */
+const AUTH_MSG = {
+  "auth/invalid-credential": "اسم المستخدم أو كلمة السر غير صحيحة.", "auth/wrong-password": "اسم المستخدم أو كلمة السر غير صحيحة.",
+  "auth/user-not-found": "اسم المستخدم أو كلمة السر غير صحيحة.", "auth/invalid-email": "اسم المستخدم غير صالح.",
+  "auth/too-many-requests": "محاولات كتير. استنى دقائق وحاول تاني.", "auth/network-request-failed": "مفيش إنترنت. أول دخول على أي جهاز محتاج إنترنت.",
+  "auth/weak-password": "كلمة السر قصيرة. 6 حروف أو أرقام على الأقل.", "auth/requires-recent-login": "اخرج وادخل تاني وبعدين جرّب."
+};
+const authMsg = e => AUTH_MSG[e && e.code] || "حصل خطأ. حاول تاني.";
+const accountName = () => ((authUser && authUser.email) || "").split("@")[0];
+function renderLogin(app) {
+  app.innerHTML = `<div class="screen"><form class="card" id="auth-form" novalidate>
+    <div><div class="logo">Pets Home</div><p class="muted">سجّل الدخول بحساب المزرعة. البيانات محفوظة على السحابة ومتزامنة بين كل الأجهزة.</p></div>
+    <div class="form">
+      ${field("اسم المستخدم", `<input type="text" name="user" id="a-user" dir="ltr" autocapitalize="none" autocomplete="username" spellcheck="false" value="${esc(lsGet("petshome:lastUser") || "")}">`, "full")}
+      ${field("كلمة السر", `<input type="password" name="pass" id="a-pass" dir="ltr" autocomplete="current-password">`, "full")}
+    </div>
+    <div class="err" id="a-err" hidden></div>
+    <button class="btn primary block" type="submit" id="a-submit">دخول</button></form></div>`;
+  $("#auth-form").addEventListener("submit", async e => {
+    e.preventDefault(); const fd = new FormData(e.target); const err = $("#a-err"); err.hidden = true;
+    const user = fv(fd, "user"), pass = (fd.get("pass") || "").toString();
+    if (!user || !pass) { err.textContent = "اكتب اسم المستخدم وكلمة السر."; err.hidden = false; return; }
+    $("#a-submit").disabled = true; document.activeElement && document.activeElement.blur();
+    try { await B.signIn(user, pass); lsSet("petshome:lastUser", user); }
+    catch (ex) { const er = $("#a-err"); if (er) { er.textContent = authMsg(ex); er.hidden = false; } const b = $("#a-submit"); if (b) b.disabled = false; }
+  });
+}
+function renderDenied(app) {
+  app.innerHTML = `<div class="screen"><div class="card"><div class="logo">Pets Home</div>
+    <p>الحساب <b dir="ltr">${esc(accountName())}</b> ليس له صلاحية على بيانات المزرعة.</p><p class="small muted">ادخل بحساب المزرعة.</p>
+    <button type="button" class="btn primary block" data-act="logout">تسجيل الخروج</button></div></div>`;
+}
+function accountSheet() {
+  openModal("حسابي", `<div class="stack"><div class="sum-box"><div><span>الحساب</span><b dir="ltr">${esc(accountName())}</b></div>
+      <div class="small"><span>الحالة</span><span>${navigator.onLine === false ? "غير متصل — التسجيلات هتترفع لما النت يرجع" : "متصل بالسحابة"}</span></div></div>
+    <h3>تغيير كلمة السر</h3><div class="form">${field("كلمة السر الحالية", `<input type="password" name="cur" id="f-cur" dir="ltr" autocomplete="current-password">`)}${field("كلمة السر الجديدة", `<input type="password" name="next" id="f-next" dir="ltr" autocomplete="new-password">`, "", "6 حروف أو أرقام على الأقل")}</div></div>`, {
+    submitLabel: "تغيير كلمة السر", noFocus: true, done: "تم تغيير كلمة السر",
+    extra: `<button type="button" class="btn danger" data-act="logout">تسجيل الخروج</button>`,
+    onSubmit: async fd => {
+      const c = (fd.get("cur") || "").toString(), n = (fd.get("next") || "").toString();
+      if (!c || !n) return "اكتب كلمة السر الحالية والجديدة."; if (n.length < 6) return "كلمة السر الجديدة 6 حروف أو أرقام على الأقل.";
+      try { await B.changePassword(c, n); } catch (ex) { return authMsg(ex); }
+    }
+  });
+}
+function signOutCloud() { closeModal(true); Cloud.stop(); cloudBooted = false; if (B) B.signOut(); }
+async function cloudAfterReady() {
+  try {
+    const marker = await Local.getKey("__meta_cloud");
+    if ((S.meta.size || recordCount()) && (!marker || marker.appVersion !== APP_VERSION)) await Local.snapshot(`نسخة من السحابة قبل التحديث إلى ${APP_VERSION}`, marker && marker.appVersion);
+    await Local.putKey("__meta_cloud", { appVersion: APP_VERSION, updatedAt: nowISO() });
+    const appDoc = S.meta.get("app"), from = appDoc && appDoc.schema ? appDoc.schema : 1;
+    MIGRATIONS.filter(m => m.to > from && m.to <= SCHEMA).sort((a, b) => a.to - b.to).forEach(m => m.run());
+    if (S.meta.get("settings") && (!appDoc || appDoc.schema !== SCHEMA || appDoc.appVersion !== APP_VERSION)) Store.put("meta", "app", { schema: SCHEMA, appVersion: APP_VERSION, updatedAt: nowISO() });
+  } catch (e) { console.error(e); }
+}
+const countData = d => ["items", "workers", "customers", ...BUCKETED].reduce((a, c) => a + Object.keys((d && d[c]) || {}).length, 0);
+function uploadBanner() {
+  if (MODE !== "cloud" || !localPending || localPending.hidden) return "";
+  return `<div class="banner info">على الموبايل ده ${nf(localPending.count, 0)} سجل اتسجلوا قبل التحويل للسحابة. <button type="button" class="linkbtn" data-act="upload-local">ارفعهم للحساب</button> · <button type="button" class="linkbtn" data-act="skip-upload">مش دلوقتي</button></div>`;
+}
+function uploadLocal() {
+  if (!localPending) return;
+  const d = localPending.data, ops = []; let n = 0;
+  for (const c of [...PLAIN, ...BUCKETED]) Object.entries(d[c] || {}).forEach(([id, rec]) => {
+    if (S[c].has(id)) return;
+    ops.push({ op: "put", col: c, id, data: rec }); if (c !== "meta") n++;
+  });
+  openModal("رفع بيانات الموبايل", `<p>هيترفع <b>${nf(n, 0)}</b> سجل من الموبايل ده للحساب، ومعاهم سجل العمليات.</p><p class="small muted">السجلات اللي موجودة على الحساب بالفعل مش هتتغير، والبيانات على الموبايل هتفضل زي ما هي.</p>`, {
+    submitLabel: "رفع البيانات", noFocus: true,
+    onSubmit: async () => {
+      Store.bulk(ops); mergeAudit(d.audit);
+      await Local.putKey("__uploaded", { at: nowISO(), count: n });
+      localPending = null;
+      audit("إضافة", "upload", "", `رفع ${n} سجل من الموبايل للسحابة`);
+      toast(`تم رفع ${n} سجل`);
     }
   });
 }
@@ -1332,6 +1761,8 @@ function resetAll() {
 /* ================== Install prompt ================== */
 let installPrompt = null;
 window.addEventListener("beforeinstallprompt", e => { e.preventDefault(); installPrompt = e; scheduleRender(); });
+window.addEventListener("online", () => scheduleRender());
+window.addEventListener("offline", () => scheduleRender());
 window.addEventListener("appinstalled", () => { installPrompt = null; toast("تم تثبيت التطبيق"); scheduleRender(); });
 
 /* ================== Event delegation ================== */
@@ -1341,6 +1772,14 @@ document.addEventListener("click", e => {
   const id = b.dataset.id; const act = b.dataset.act;
   const H = {
     "backup": backupSheet, "reset": resetAll,
+    "account": accountSheet, "logout": signOutCloud,
+    "upload-local": uploadLocal, "skip-upload": () => { if (localPending) localPending.hidden = true; render(); },
+    "pay-month": () => { payMonth = id; render(); },
+    "pe-new": () => payEntryForm(id, b.dataset.emp),
+    "edit-pe": () => { const p = S.payroll.get(id); if (p) payEntryForm(p.type, p.empId, p); },
+    "del-pe": () => { const p = S.payroll.get(id); if (!p) return; confirmBox("حذف حركة مرتبات", `حذف ${esc(PAY_TYPES[p.type] ? PAY_TYPES[p.type].label : p.type)} ${money(p.amount)} — ${esc(wName(p.empId))} بتاريخ ${fmtDate(p.date)}؟`, "حذف", () => { Store.remove("payroll", id); audit("حذف", "payroll", id, `حذف ${PAY_TYPES[p.type] ? PAY_TYPES[p.type].short : p.type} ${money(p.amount)} — ${wName(p.empId)} بتاريخ ${fmtDate(p.date)}`); }); },
+    "emp-st": () => empStatement(id, b.dataset.month),
+    "salary": () => salaryForm(id),
     "install": () => { if (installPrompt) { installPrompt.prompt(); installPrompt.userChoice.finally(() => { installPrompt = null; scheduleRender(); }); } },
     "quick": showQuick, "more": showMore,
     "new-production": () => moveForm("production"), "new-opening": () => moveForm("opening"), "new-withdraw": () => moveForm("withdraw"),
@@ -1378,6 +1817,21 @@ async function boot() {
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch {}
   let r;
   try { r = await Local.init(); } catch (e) { console.error(e); r = { ok: false, data: {} }; }
+  if (cloudConfigured()) {
+    /* Cloud mode: the phone's own saved records stay untouched; they are offered for upload once. */
+    MODE = "cloud";
+    Local.snapInfo = r.ok ? await Local.getKey("__snapshot_info") : null;
+    if (r.ok) {
+      const n = countData(r.data), done = await Local.getKey("__uploaded"), demo = r.data.meta && r.data.meta.settings && r.data.meta.settings.demo;
+      if (n > 0 && !done && !demo) localPending = { data: r.data, count: n };
+    }
+    try { const mod = await import("./backend.js"); B = mod.createBackend(window.PETSHOME_FIREBASE); }
+    catch (e) { console.error(e); phase = "cloudfail"; render(); return; }
+    phase = "ready";
+    B.onAuth(u => { if (!u && Cloud.started) Cloud.stop(); if (!u) cloudBooted = false; authUser = u; render(); });
+    render();
+    return;
+  }
   if (!r.ok) { phase = "readfail"; render(); return; }
   COLS.forEach(c => S[c] = toMap(r.data[c]));
   ver++;
@@ -1394,6 +1848,6 @@ async function boot() {
   await Local.putKey("__meta", { schema: SCHEMA, appVersion: APP_VERSION, updatedAt: nowISO() });
   phase = "ready"; render();
 }
-window.PH = { version: APP_VERSION, _debug: { S, Store, Local, go, me, balance, custBalances, orderPayState, moneySummary, allAudit, setPreset, rp, render, saveCount, countDraft, moveForm, orderForm, paymentForm, financeForm, workerForm, closeModal, stockSummary, seedDemo, backupData, importBackup, lastBy, monthReport, dataMonths, monthText } };
+window.PH = { version: APP_VERSION, get mode() { return MODE; }, _debug: { Cloud, payLedger, payRow, payrollMonth, salaryFor, payEntryForm, empStatement, salaryForm, uploadLocal, get localPending() { return localPending; }, S, Store, Local, go, me, balance, custBalances, orderPayState, moneySummary, allAudit, setPreset, rp, render, saveCount, countDraft, moveForm, orderForm, paymentForm, financeForm, workerForm, closeModal, stockSummary, seedDemo, backupData, importBackup, lastBy, monthReport, dataMonths, monthText } };
 boot();
 })();

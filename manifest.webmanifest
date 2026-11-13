@@ -1,7 +1,7 @@
 {
   "name": "Pets Home — إدارة المزرعة",
   "short_name": "Pets Home",
-  "description": "إدارة مخزون وإنتاج وأوردرات ومصروفات مزرعة Pets Home — تعمل بدون إنترنت",
+  "description": "إدارة مخزون وإنتاج وأوردرات ومصروفات ومرتبات مزرعة Pets Home",
   "id": "./",
   "start_url": "./",
   "scope": "./",
@@ -9,8 +9,8 @@
   "orientation": "any",
   "lang": "ar",
   "dir": "rtl",
-  "background_color": "#EFF2EE",
-  "theme_color": "#1E6B57",
+  "background_color": "#0B100D",
+  "theme_color": "#141B17",
   "icons": [
     { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
     { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },

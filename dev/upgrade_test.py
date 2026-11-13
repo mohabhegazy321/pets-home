@@ -13,7 +13,7 @@ from playwright.async_api import async_playwright
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHROME = os.environ.get("CHROME", "/usr/bin/google-chrome")
 PORT = int(os.environ.get("PORT", "8799"))
-APP_FILES = ["index.html", "app.js", "sw.js", "manifest.webmanifest", "icons"]
+APP_FILES = ["index.html", "app.js", "sw.js", "manifest.webmanifest", "icons", "backend.js", "firebase-config.js"]
 
 def export_ref(ref, dest):
     """Write the app files as they are at a git ref into dest."""

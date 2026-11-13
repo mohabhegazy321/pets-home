@@ -5,8 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Pets Home</title>
 <meta name="description" content="Pets Home: إدارة مخزون وإنتاج وأوردرات ومصروفات المزرعة، تعمل على الموبايل بدون إنترنت">
-<meta name="theme-color" content="#1E6B57" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#18221C" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#141B17">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Pets Home">
@@ -20,26 +19,17 @@
 /* Layout: phone first — app bar on top, five-slot tab bar at the bottom with a raised "add" button, forms as bottom sheets.
    From 960px wide: a right-hand rail of sections (RTL) and centred dialogs. */
 :root{
-  --bg:#EFF2EE; --surface:#FFFFFF; --sunk:#E5EAE4; --ink:#17221C; --muted:#5B6A61; --line:#D3DCD4;
-  --accent:#1E6B57; --accent-ink:#FFFFFF; --accent-soft:#D9EBE4; --plate:#B97A12; --plate-soft:#F6E8CC;
-  --good:#2B7A4B; --good-soft:#DCEFE2; --warn:#A8670B; --warn-soft:#F7E9CF; --bad:#B0281F; --bad-soft:#F7DEDB;
-  --scrim:rgba(10,20,15,.45);
-  --shadow:0 1px 2px rgba(20,40,30,.06),0 6px 24px rgba(20,40,30,.08);
+  /* Dark-only palette: deep green-black ground, raised surfaces a step lighter, mint accent, amber for plates/stock. */
+  --bg:#0B100D; --surface:#141B17; --sunk:#0F1512; --raise:#1B241F; --ink:#E6EEE9; --muted:#8FA096; --line:#26322B;
+  --accent:#4FB592; --accent-ink:#04110B; --accent-soft:#163029; --plate:#E0A548; --plate-soft:#2C2312;
+  --good:#66C48F; --good-soft:#12291C; --warn:#E3AE5E; --warn-soft:#2E2312; --bad:#EE8379; --bad-soft:#331816;
+  --scrim:rgba(0,0,0,.65);
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 28px rgba(0,0,0,.35);
   --f-body:"IBM Plex Sans Arabic",Tahoma,"Segoe UI",system-ui,sans-serif;
   --f-display:"Reem Kufi","IBM Plex Sans Arabic",Tahoma,sans-serif;
   --r:12px; --tab-h:64px;
-  color-scheme:light;
+  color-scheme:dark;
 }
-@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
-  --bg:#111814; --surface:#18221C; --sunk:#0D130F; --ink:#E4ECE6; --muted:#97A79D; --line:#2A3830;
-  --accent:#5DBB9C; --accent-ink:#08140F; --accent-soft:#1D3A30; --plate:#E3A94A; --plate-soft:#3A2E17;
-  --good:#6CC994; --good-soft:#173524; --warn:#E5B060; --warn-soft:#3A2C14; --bad:#F08A80; --bad-soft:#3E1C19;
-  --scrim:rgba(0,0,0,.6); --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 24px rgba(0,0,0,.3); color-scheme:dark}}
-:root[data-theme="dark"]{
-  --bg:#111814; --surface:#18221C; --sunk:#0D130F; --ink:#E4ECE6; --muted:#97A79D; --line:#2A3830;
-  --accent:#5DBB9C; --accent-ink:#08140F; --accent-soft:#1D3A30; --plate:#E3A94A; --plate-soft:#3A2E17;
-  --good:#6CC994; --good-soft:#173524; --warn:#E5B060; --warn-soft:#3A2C14; --bad:#F08A80; --bad-soft:#3E1C19;
-  --scrim:rgba(0,0,0,.6); --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 24px rgba(0,0,0,.3); color-scheme:dark}
 
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;min-height:100%}
@@ -85,6 +75,8 @@ main{padding-block:18px calc(var(--tab-h) + 40px + env(safe-area-inset-bottom,0p
   .appbar,.tabbar{display:none}
   main{padding-block:26px 60px;padding-left:max(28px,env(safe-area-inset-left,0px));padding-right:max(28px,env(safe-area-inset-right,0px))}
 }
+.monthnav{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.monthnav b{font-size:1.02rem}
 .rail-only{display:none}
 @media (min-width:960px){.rail-only{display:flex;gap:8px;flex-wrap:wrap}}
 .brand{display:flex;flex-direction:column;gap:2px;padding:0 8px}
@@ -183,7 +175,8 @@ tr.group td{background:var(--sunk);font-weight:600}
 .seg button[aria-pressed="true"]{background:var(--surface);color:var(--ink);font-weight:700;box-shadow:var(--shadow)}
 
 input[type=text],input[type=number],input[type=date],input[type=password],input[type=tel],input[type=search],input[type=email],select,textarea{
-  border:1px solid var(--line);background:var(--surface);border-radius:10px;padding:10px 12px;width:100%;min-width:0;font-size:16px;min-height:44px}
+  border:1px solid var(--line);background:var(--sunk);border-radius:10px;padding:10px 12px;width:100%;min-width:0;font-size:16px;min-height:44px}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
 textarea{min-height:64px;resize:vertical}
 .form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 14px}
 @media (max-width:600px){.form{grid-template-columns:minmax(0,1fr)}}
@@ -258,6 +251,7 @@ body:has(.overlay) .toast{bottom:auto;top:calc(14px + env(safe-area-inset-top,0p
 <body>
 <div id="app"><div class="screen"><div class="loading">جاري فتح Pets Home…</div></div></div>
 <div id="modal-root"></div>
+<script src="firebase-config.js"></script>
 <script src="app.js"></script>
 <script>
   if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost")) {

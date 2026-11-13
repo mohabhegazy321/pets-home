@@ -1,0 +1,14 @@
+rules_version = '2';
+// Pets Home security rules — paste into Firebase console → Firestore Database → Rules → Publish.
+// Only the farm's admin account (username "Hegazy") can read or write anything.
+// Employee accounts will be added here later.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function admin() {
+      return request.auth != null && request.auth.token.email == "hegazy@petshome.local";
+    }
+    match /{document=**} {
+      allow read, write: if admin();
+    }
+  }
+}

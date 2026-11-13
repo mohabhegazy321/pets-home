@@ -1,6 +1,6 @@
-# Pets Home (local edition): install on the phone
+# Pets Home: install on the phone
 
-This version runs entirely on one phone. There are no accounts and no database to set up, and it needs no internet after the first install. All records are saved on the phone itself.
+Until cloud sync is turned on (see `CLOUD_SETUP.md`), the app runs on each phone on its own, with records saved on the phone. Once cloud sync is on, you sign in with the farm account and every device shares the same data.
 
 The app has to be opened once from a web link so Chrome can install it. After that it opens from its own icon and works offline. Getting the link takes about 5 minutes with GitHub Pages (free).
 

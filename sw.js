@@ -1,8 +1,8 @@
-// Pets Home (local edition) service worker.
+// Pets Home service worker. (Firebase data and sign-in requests are never touched here; Firestore keeps its own offline copy.)
 // Online: always loads the newest app files, so publishing an update only needs a refresh.
 // Offline (or slow network): opens instantly from the saved copy.
-const VERSION = "petshome-local-v2";
-const SHELL = ["./", "./index.html", "./app.js", "./manifest.webmanifest",
+const VERSION = "petshome-v3";
+const SHELL = ["./", "./index.html", "./app.js", "./backend.js", "./firebase-config.js", "./manifest.webmanifest",
   "./icons/icon-192.png", "./icons/icon-512.png", "./icons/maskable-512.png", "./icons/apple-touch-icon.png"];
 const FONT_HOSTS = ["fonts.googleapis.com", "fonts.gstatic.com"];
 
@@ -21,7 +21,7 @@ self.addEventListener("fetch", e => {
   if (req.method !== "GET") return;
   const url = new URL(req.url);
   if (url.origin === self.location.origin) e.respondWith(networkFirst(req));
-  else if (FONT_HOSTS.includes(url.hostname)) e.respondWith(cacheFirst(req));
+  else if (FONT_HOSTS.includes(url.hostname) || (url.hostname === "www.gstatic.com" && url.pathname.startsWith("/firebasejs/"))) e.respondWith(cacheFirst(req));
 });
 async function networkFirst(req) {
   const cache = await caches.open(VERSION);
