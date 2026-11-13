@@ -39,6 +39,8 @@ async def main():
     site = tempfile.mkdtemp(prefix="petshome-site-")
     export_ref(ref, site)
     new_version = re.search(r'const APP_VERSION = "([^"]+)"', open(os.path.join(ROOT, "app.js"), encoding="utf-8").read()).group(1)
+    if is_cloud(site):
+        return await cloud_upgrade(ref, site, new_version)
     srv = subprocess.Popen([sys.executable, "-m", "http.server", str(PORT), "--bind", "127.0.0.1", "--directory", site], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1); url = f"http://localhost:{PORT}/"; fails = []
     try:
@@ -61,7 +63,7 @@ async def main():
             got = None
             for attempt in range(3):
                 await pg.reload(); await pg.wait_for_timeout(2500)
-                got = await pg.evaluate("window.PH && window.PH.version")
+                got = await version_of(pg)
                 if got == new_version: break
             print(f"refreshes needed to reach {new_version}: {attempt + 1} (running: {got})")
             if got != new_version: fails.append(f"new version did not load (running {got})")
@@ -103,6 +105,96 @@ async def main():
             await b.close()
     except SystemExit:
         raise
+    finally:
+        srv.terminate(); shutil.rmtree(site, ignore_errors=True)
+    finish(fails, None, None)
+
+async def version_of(pg):
+    """Version running in the page; tolerates the app reloading itself once when a new version takes over."""
+    for _ in range(6):
+        try: return await pg.evaluate("window.PH && window.PH.version")
+        except Exception: await pg.wait_for_timeout(1500)
+    return None
+
+def is_cloud(dirpath):
+    try: code = "\n".join(l for l in open(os.path.join(dirpath, "firebase-config.js"), encoding="utf-8") if not l.strip().startswith("//"))
+    except FileNotFoundError: return False
+    return not re.search(r'apiKey:\s*"PASTE', code)
+
+MOCK_USERS = {"hegazy@petshome.local": "test-pass-123"}
+def cloud_records(mock):
+    out = {c: dict(mock.get(c, {})) for c in ["meta", "items", "workers", "customers"]}
+    for d in mock.get("ledger", {}).values():
+        if d.get("type"): out.setdefault(d["type"], {}).update(d.get("r") or {})
+    out["audit"] = dict(mock.get("audit", {}))
+    return out
+
+async def cloud_upgrade(ref, site, new_version):
+    """The live version is in cloud mode: run old → new against dev/mock_backend.js (same interface and access rule)
+    and check that every record in the cloud is unchanged after the update."""
+    mock = os.path.join(ROOT, "dev", "mock_backend.js")
+    shutil.copy(mock, os.path.join(site, "backend.js"))
+    srv = subprocess.Popen([sys.executable, "-m", "http.server", str(PORT), "--bind", "127.0.0.1", "--directory", site], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1); url = f"http://localhost:{PORT}/"; fails = []
+    try:
+        async with async_playwright() as p:
+            b = await p.chromium.launch(executable_path=CHROME, args=["--no-sandbox"])
+            pg = await (await b.new_context(viewport={"width": 390, "height": 844}, is_mobile=True)).new_page(); errs = []
+            pg.on("pageerror", lambda e: errs.append(str(e)))
+            await pg.goto(url); await pg.wait_for_timeout(500)
+            await pg.evaluate("u => localStorage.setItem('__mockusers', JSON.stringify(u))", MOCK_USERS)
+            await pg.reload(); await pg.wait_for_timeout(1200)
+            await pg.fill("#a-user", "Hegazy"); await pg.fill("#a-pass", MOCK_USERS["hegazy@petshome.local"]); await pg.click("#a-submit"); await pg.wait_for_timeout(1500)
+            if await pg.locator("#welcome").count():
+                await pg.fill("#w-name", "محمد"); await pg.click("#welcome button[type=submit]"); await pg.wait_for_timeout(500)
+            # 1. the cloud today: farm records of every kind, entered through the old version
+            await pg.evaluate("""() => { const D = window.PH._debug, t = new Date().toISOString().slice(0, 10), m = t.slice(0, 7), at = new Date().toISOString();
+              D.Store.put("items", "u-it", { name: "ميل وورم", unit: "كجم", perPlate: 2, price: 150, priceBasis: "plate", minPlates: 5, active: true });
+              D.Store.put("workers", "u-w", { name: "أحمد", active: true, startMonth: m, salary: 3000, salaryHistory: [{ from: m, amount: 3000 }] });
+              D.Store.put("customers", "u-c", { name: "محل النيل", phone: "0100" });
+              D.Store.put("moves", "u-m", { type: "opening", itemId: "u-it", plates: 20, qty: 40, date: t, note: "", by: "owner", at });
+              D.Store.put("orders", "u-o", { customerId: "u-c", date: t, status: "delivered", lines: [{ itemId: "u-it", plates: 3, qty: 6, price: 150, basis: "plate", total: 450 }], subtotal: 450, discount: 0, total: 450, paidNow: 200, note: "", by: "owner", no: "U-1", at });
+              D.Store.put("payments", "u-p", { customerId: "u-c", orderId: "u-o", amount: 100, date: t, method: "نقدي", note: "", by: "owner", at });
+              D.Store.put("finance", "u-f", { kind: "expense", category: "خامات", amount: 500, date: "2026-10-05", payType: "cash", note: "", by: "owner", at: "2026-10-05T10:00:00Z" });
+              D.Store.put("payroll", "u-pr", { empId: "u-w", type: "advance", amount: 200, date: t, note: "", by: "owner", at });
+              D.Store.put("counts", "u-k", { date: t, lines: [{ itemId: "u-it", system: 17, actual: 17, diff: 0 }], applied: true, by: "owner", at }); }""")
+            await pg.wait_for_timeout(1000)
+            before = cloud_records(await pg.evaluate("JSON.parse(localStorage.getItem('__mockcloud') || '{}')"))
+            n_before = sum(len(v) for k, v in before.items() if k not in ("meta", "audit"))
+            print(f"old version ({ref}, cloud mode): {n_before} records in the cloud")
+            # 2. publish the new version (still talking to the stand-in cloud) and refresh
+            publish_worktree(site); shutil.copy(mock, os.path.join(site, "backend.js"))
+            got = None
+            for attempt in range(3):
+                await pg.reload(); await pg.wait_for_timeout(2500)
+                got = await version_of(pg)
+                if got == new_version: break
+            print(f"refreshes needed to reach {new_version}: {attempt + 1} (running: {got})")
+            if got != new_version: fails.append(f"new version did not load (running {got})")
+            if await pg.locator("#auth-form").count(): fails.append("signed out by the update")
+            # 3. every cloud record unchanged
+            await pg.wait_for_timeout(800)
+            after = cloud_records(await pg.evaluate("JSON.parse(localStorage.getItem('__mockcloud') || '{}')"))
+            for c, recs in before.items():
+                for rid, rec in recs.items():
+                    now = after.get(c, {}).get(rid)
+                    if c == "audit":
+                        if not now or now.get("entries", [])[:len(rec.get("entries", []))] != rec.get("entries", []): fails.append(f"audit/{rid} changed")
+                    elif c == "meta":
+                        if rid == "app": continue
+                        for k, v in rec.items():
+                            if now is None or now.get(k) != v: fails.append(f"meta/{rid}.{k} changed")
+                    elif now != rec: fails.append(f"{c}/{rid} changed or missing")
+            shown = await pg.evaluate("(() => { const D = window.PH._debug; return { bal: D.balance('u-it').closing, owed: D.payRow('u-w', new Date().toISOString().slice(0,7)).due, orders: D.S.orders.size }; })()")
+            print("app shows:", shown)
+            if shown != {"bal": 17, "owed": 2800, "orders": 1}: fails.append(f"app shows different data: {shown}")
+            snap = await pg.evaluate(DUMP_IDB)
+            print("automatic snapshot on the phone:", (snap or {}).get("__snapshot", {}).get("info", {}).get("reason"))
+            await pg.evaluate("""() => window.PH._debug.Store.put("finance", "u-f2", { kind: "income", category: "أخرى", amount: 7, date: "2026-01-16", payType: "cash", note: "", by: "owner", at: "2026-01-16T10:00:00Z" })""")
+            await pg.wait_for_timeout(800)
+            if "u-f2" not in cloud_records(await pg.evaluate("JSON.parse(localStorage.getItem('__mockcloud') || '{}')")).get("finance", {}): fails.append("new entries are not saved to the cloud after the update")
+            if errs: fails.append("page errors: " + "; ".join(errs))
+            await b.close()
     finally:
         srv.terminate(); shutil.rmtree(site, ignore_errors=True)
     finish(fails, None, None)

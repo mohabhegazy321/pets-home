@@ -28,7 +28,7 @@ const pnum = v => { const x = parseFloat(String(v ?? "").trim().replace(/[٠-٩]
 const nowISO = () => new Date().toISOString();
 
 /* ================== State & on-device storage ================== */
-const APP_VERSION = "v3.1";
+const APP_VERSION = "v3.2";
 /* Storage format version. Raise it only together with a migration in MIGRATIONS below — never by changing or dropping saved data. */
 const SCHEMA = 1;
 const PLAIN = ["meta", "items", "workers", "customers"];
