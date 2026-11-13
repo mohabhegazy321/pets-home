@@ -121,7 +121,7 @@ def is_cloud(dirpath):
     except FileNotFoundError: return False
     return not re.search(r'apiKey:\s*"PASTE', code)
 
-MOCK_USERS = {"hegazy@petshome.local": "test-pass-123"}
+MOCK_USERS = {"hegazy@petshome.local": {"uid": "uid-hegazy", "pass": "test-pass-123"}}
 def cloud_records(mock):
     out = {c: dict(mock.get(c, {})) for c in ["meta", "items", "workers", "customers"]}
     for d in mock.get("ledger", {}).values():
@@ -144,7 +144,7 @@ async def cloud_upgrade(ref, site, new_version):
             await pg.goto(url); await pg.wait_for_timeout(500)
             await pg.evaluate("u => localStorage.setItem('__mockusers', JSON.stringify(u))", MOCK_USERS)
             await pg.reload(); await pg.wait_for_timeout(1200)
-            await pg.fill("#a-user", "Hegazy"); await pg.fill("#a-pass", MOCK_USERS["hegazy@petshome.local"]); await pg.click("#a-submit"); await pg.wait_for_timeout(1500)
+            await pg.fill("#a-user", "Hegazy"); await pg.fill("#a-pass", MOCK_USERS["hegazy@petshome.local"]["pass"]); await pg.click("#a-submit"); await pg.wait_for_timeout(1500)
             if await pg.locator("#welcome").count():
                 await pg.fill("#w-name", "محمد"); await pg.click("#welcome button[type=submit]"); await pg.wait_for_timeout(500)
             # 1. the cloud today: farm records of every kind, entered through the old version

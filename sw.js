@@ -1,7 +1,7 @@
 // Pets Home service worker. (Firebase data and sign-in requests are never touched here; Firestore keeps its own offline copy.)
 // Online: always loads the newest app files, so publishing an update only needs a refresh.
 // Offline (or slow network): opens instantly from the saved copy.
-const VERSION = "petshome-v3-2";
+const VERSION = "petshome-v4";
 const SHELL = ["./", "./index.html", "./app.js", "./backend.js", "./firebase-config.js", "./manifest.webmanifest",
   "./icons/icon-192.png", "./icons/icon-512.png", "./icons/maskable-512.png", "./icons/apple-touch-icon.png"];
 const FONT_HOSTS = ["fonts.googleapis.com", "fonts.gstatic.com"];

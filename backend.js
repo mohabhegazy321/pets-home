@@ -4,7 +4,7 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import {
   getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut, updatePassword,
-  EmailAuthProvider, reauthenticateWithCredential
+  EmailAuthProvider, reauthenticateWithCredential, createUserWithEmailAndPassword
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager, memoryLocalCache,
@@ -40,8 +40,18 @@ export function createBackend(config) {
       await reauthenticateWithCredential(u, EmailAuthProvider.credential(u.email, current));
       await updatePassword(u, next);
     },
+    // Creates an employee's login without signing the manager out (a second, throwaway auth instance).
+    // Needs "Enable create (sign-up)" on in Firebase Authentication settings; the rules give a new login no access
+    // until the manager's app writes its accounts/<uid> document.
+    async createAccount(user, pass) {
+      const second = getAuth(initializeApp(config, "account-maker-" + Date.now()));
+      const cred = await createUserWithEmailAndPassword(second, toEmail(user), pass);
+      const uid = cred.user.uid; await signOut(second); return uid;
+    },
+    watchDoc(col, id, onData, onErr) { return onSnapshot(doc(db, col, id), s => onData(s.exists() ? s.data() : null), onErr); },
     watch(col, onData, onErr, opts = {}) {
       let q = collection(db, col);
+      if (opts.type) q = query(q, where("type", "==", opts.type));
       if (opts.since) q = query(q, where("date", ">=", opts.since));
       return onSnapshot(q, snap => onData(wrap(snap), snap.metadata.fromCache), onErr);
     },

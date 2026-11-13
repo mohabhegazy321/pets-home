@@ -9,7 +9,7 @@ Until this is done, the app keeps working in local mode on each phone. It takes 
 3. Create the farm account: **Authentication → Users → Add user**.
    - Email: `hegazy@petshome.local`
    - Password: the password you chose for the Hegazy account
-4. Block anyone else from creating accounts: **Authentication → Settings → User actions**, untick **Enable create (sign-up)**, then **Save**.
+4. Leave **Authentication → Settings → User actions → Enable create (sign-up)** ticked. The app needs it to make employee logins. A login made any other way gets no access, because the rules only let in the Hegazy account and logins the manager switched on in the app.
 
 ## 2. Create the database
 
@@ -31,3 +31,16 @@ Until this is done, the app keeps working in local mode on each phone. It takes 
 - **No internet at the farm:** keep using the app normally. Entries upload automatically when the connection returns. Each new device needs internet for its first sign-in.
 
 The password can be changed from **المزيد → حسابي** (More → My account).
+
+## 5. Employee logins (from v4)
+
+Do this once:
+
+1. **Authentication → Settings → User actions**: tick **Enable create (sign-up)** and click **Save**.
+2. **Firestore Database → Rules**: replace everything with the new `firestore.rules` from this repository and click **Publish**.
+
+After that, Mohamed opens **المرتبات** (payroll) and taps an employee. Under **دخول للتطبيق** (app login) he chooses a username, a password and what the employee may do (production, orders, payments, expenses and so on). The app shows the login details with a WhatsApp button to send them.
+
+- Employees never see salaries, payroll, the employee list or reports, and can't delete anything.
+- To block someone, stop their login from the same place, or mark the employee as no longer working.
+- A forgotten employee password can't be reset from the app. Stop that login and make a new username.

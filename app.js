@@ -28,10 +28,10 @@ const pnum = v => { const x = parseFloat(String(v ?? "").trim().replace(/[٠-٩]
 const nowISO = () => new Date().toISOString();
 
 /* ================== State & on-device storage ================== */
-const APP_VERSION = "v3.2";
+const APP_VERSION = "v4";
 /* Storage format version. Raise it only together with a migration in MIGRATIONS below — never by changing or dropping saved data. */
 const SCHEMA = 1;
-const PLAIN = ["meta", "items", "workers", "customers"];
+const PLAIN = ["meta", "items", "workers", "customers", "suppliers"];
 const BUCKETED = ["moves", "orders", "payments", "finance", "counts", "payroll"];
 const COLS = [...PLAIN, ...BUCKETED, "audit"];
 const S = {}; COLS.forEach(c => S[c] = new Map());
@@ -161,25 +161,32 @@ const Cloud = {
   start() {
     if (this.started) return; this.started = true; this.ready.clear(); this.timedOut = false; this.error = null;
     this.timer = setTimeout(() => { this.timedOut = true; scheduleRender(); }, 12000);
-    const fail = name => err => { console.error(name, err); if (err && err.code === "permission-denied") this.error = "denied"; this.ready.add(name); scheduleRender(); };
+    /* An employee only listens to what their login may read (see firestore.rules); the manager listens to everything. */
+    const worker = isWorker(), sales = can("orders") || can("payments");
+    const plain = worker ? ["meta", "items", ...(sales ? ["customers"] : []), ...(can("finance") ? ["suppliers"] : [])] : PLAIN;
+    const types = worker ? ["moves", "orders", "counts", ...(sales ? ["payments"] : []), ...(can("finance") ? ["finance"] : [])] : BUCKETED;
+    const wantAudit = !worker || can("log");
+    this.expected = plain.length + types.length + (wantAudit ? 1 : 0) + (worker ? 0 : 1);
+    const fail = name => err => { console.error(name, err); if (err && err.code === "permission-denied" && (!worker || name === "meta")) this.error = "denied"; this.ready.add(name); scheduleRender(); };
     const done = name => { this.ready.add(name); if (this.isReady()) clearTimeout(this.timer); ver++; scheduleRender(); };
-    PLAIN.forEach(col => this.unsubs.push(B.watch(col, docs => {
+    plain.forEach(col => this.unsubs.push(B.watch(col, docs => {
       S[col] = new Map(docs.map(d => [d.id, Object.assign({}, d.data, { id: d.id })])); done(col);
     }, fail(col))));
-    this.unsubs.push(B.watch("ledger", docs => {
-      const maps = {}; BUCKETED.forEach(t => maps[t] = new Map());
-      docs.forEach(d => { const t = d.data.type; if (!maps[t]) return; Object.entries(d.data.r || {}).forEach(([id, rec]) => { if (rec) { maps[t].set(id, Object.assign({}, rec, { id })); recBucket[id] = d.id; } }); });
-      BUCKETED.forEach(t => S[t] = maps[t]); done("ledger");
-    }, fail("ledger")));
-    this.unsubs.push(B.watch("audit", docs => {
+    types.forEach(t => this.unsubs.push(B.watch("ledger", docs => {
+      const m = new Map();
+      docs.forEach(d => Object.entries(d.data.r || {}).forEach(([id, rec]) => { if (rec) { m.set(id, Object.assign({}, rec, { id })); recBucket[id] = d.id; } }));
+      S[t] = m; done("ledger:" + t);
+    }, fail("ledger:" + t), { type: t })));
+    if (wantAudit) this.unsubs.push(B.watch("audit", docs => {
       S.audit = new Map(docs.map(d => [d.id, Object.assign({}, d.data, { id: d.id })])); done("audit");
     }, fail("audit"), { since: addDays(today(), -(AUDIT_WINDOW - 1)) }));
+    if (!worker) this.unsubs.push(B.watch("accounts", docs => { ACCOUNTS = new Map(docs.map(d => [d.id, d.data])); done("accounts"); }, fail("accounts")));
   },
   stop() {
     this.unsubs.forEach(u => { try { u(); } catch {} }); this.unsubs = []; this.started = false; this.ready.clear(); clearTimeout(this.timer);
     COLS.forEach(c => S[c] = new Map()); ver++;
   },
-  isReady() { return this.timedOut || this.ready.size >= PLAIN.length + 2; },
+  isReady() { return this.timedOut || this.ready.size >= (this.expected || 99); },
   ops(col, id, clean, del) {
     if (BUCKETED.includes(col)) {
       const old = recBucket[id];
@@ -213,6 +220,7 @@ const Store = {
     Object.keys(maps).forEach(c => { S[c] = maps[c]; if (MODE !== "cloud") Local.mark(c); });
     ver++;
     if (MODE === "cloud" && cloudOps.length) B.batchWrite(cloudOps).catch(cloudFail);
+    if (maps.workers) setTimeout(syncPeople, 0);
     scheduleRender();
     return Promise.resolve();
   }
@@ -226,28 +234,37 @@ const itemName = id => item(id)?.name || "صنف محذوف";
 const unitOf = id => item(id)?.unit || "";
 const workers = (all = false) => [...S.workers.values()].filter(w => all || w.active !== false).sort((a, b) => (a.name || "").localeCompare(b.name || "", "ar"));
 const ownerName = () => settings().ownerName || "المدير";
-const wName = id => !id || id === OWNER_ID ? ownerName() : (S.workers.get(id)?.name || "—");
+const peopleName = id => { const p = S.meta.get("people"); return (p && p.names && id && p.names[id]) || ""; };
+const wName = id => !id || id === OWNER_ID ? ownerName() : (S.workers.get(id)?.name || peopleName(id) || "—");
 const customers = () => [...S.customers.values()].sort((a, b) => (a.name || "").localeCompare(b.name || "", "ar"));
 const custName = id => S.customers.get(id)?.name || "عميل نقدي";
-const me = () => ({ id: OWNER_ID, name: ownerName(), role: "manager" });
-const isMgr = () => true;
-const PERMS = [["production","تسجيل الإنتاج اليومي"],["orders","الأوردرات والفواتير"],["payments","تحصيل من العملاء"],["withdraw","السحب من المخزون"],["finance","المصروفات والإيرادات"],["count","الجرد الفعلي"],["reports","التقارير والحسابات"],["log","سجل العمليات"]];
-const can = () => true;
+/* Who is using the app: the manager (local mode, or the Hegazy account) or an employee login (cloud). */
+const ADMIN_EMAIL = "hegazy@petshome.local";
+let acct;                    // employee login's account document: undefined = loading, null = none
+let acctUnsub = null;
+let ACCOUNTS = new Map();    // manager only: every employee login (accounts/<uid>)
+const isWorker = () => MODE === "cloud" && !!authUser && authUser.email !== ADMIN_EMAIL;
+const isMgr = () => !isWorker();
+const me = () => isWorker()
+  ? { id: (acct && acct.workerId) || authUser.uid, name: (acct && acct.name) || peopleName(acct && acct.workerId) || accountName(), role: "worker" }
+  : { id: OWNER_ID, name: ownerName(), role: "manager" };
+const PERMS = [["production", "تسجيل الإنتاج"], ["withdraw", "السحب من الغرفة (تالف، استخدام…)"], ["orders", "الأوردرات والعملاء"], ["payments", "التحصيل من العملاء"], ["count", "الجرد"], ["finance", "المصروفات والموردين"], ["log", "يشوف سجل كل اللي اتعمل"]];
+const can = p => !isWorker() || !!(acct && acct.active === true && acct.perms && acct.perms[p]);
 /* "Responsible worker": an optional name picked on each entry (no worker logins in the local edition). */
 let pendingBy = null;
 const lastBy = () => { const v = lsGet("petshome:lastBy"); return v && (v === OWNER_ID || (S.workers.has(v) && S.workers.get(v).active !== false)) ? v : OWNER_ID; };
 function byField(sel) {
-  if (!workers().length) return "";
+  if (!isMgr() || !workers().length) return "";
   const cur = sel || lastBy();
   return field("العامل المسؤول", `<select name="by" id="f-by">${opt(OWNER_ID, ownerName(), cur)}${workers(true).filter(w => w.active !== false || w.id === cur).map(w => opt(w.id, w.name, cur)).join("")}</select>`);
 }
-function byVal(fd) { const v = (fd.get("by") || "").toString() || lastBy(); lsSet("petshome:lastBy", v); pendingBy = v; return v; }
+function byVal(fd) { if (!isMgr()) { pendingBy = me().id; return me().id; } const v = (fd.get("by") || "").toString() || lastBy(); lsSet("petshome:lastBy", v); pendingBy = v; return v; }
 
 const EXP_CATS = ["خامات","أكل","أدوات","نقل","صيانة","أجور","كهرباء ومياه","إيجار","أخرى"];
 const INC_CATS = ["بيع خارج الأوردرات","تحصيل آخر","أخرى"];
 const WD_REASONS = ["استخدام داخلي","تالف","نافق","عينات","هدية","أخرى"];
 const UNITS = ["كجم","جرام","عدد","لتر"];
-const KIND = { opening: "رصيد افتتاحي", production: "إنتاج", sale: "مبيعات", withdraw: "سحب", adjust: "تسوية جرد" };
+const KIND = { opening: "رصيد البداية", production: "إنتاج", sale: "بيع", withdraw: "سحب من الغرفة", adjust: "تصحيح بعد الجرد" };
 
 /* Unified stock ledger: every plate in or out, from moves + orders */
 function ledger() {
@@ -286,8 +303,8 @@ const balance = id => stockSummary("", "").get(id) || { closing: 0, closingQ: 0 
 
 function orderPaid(o) { let p = +o.paidNow || 0; for (const pay of S.payments.values()) if (pay.orderId === o.id) p += +pay.amount || 0; return r2(p); }
 function orderPayState(o) { const p = orderPaid(o), t = +o.total || 0; if (t <= 0 || p >= t - 0.005) return "paid"; return p > 0 ? "partial" : "credit"; }
-const PAY_LABEL = { paid: ["تم الدفع", "good"], partial: ["متبقي جزء", "warn"], credit: ["آجل", "bad"] };
-const ST_LABEL = { prepared: ["تم التجهيز", "plate"], delivered: ["تم التسليم", "acc"], cancelled: ["ملغي", ""] };
+const PAY_LABEL = { paid: ["خالص", "good"], partial: ["دفع جزء", "warn"], credit: ["لسه ما دفعش", "bad"] };
+const ST_LABEL = { prepared: ["اتجهز", "plate"], delivered: ["اتسلم", "acc"], cancelled: ["ملغي", ""] };
 function custBalances() {
   return memo("cb", () => {
     const m = new Map(); const g = id => { if (!m.has(id)) m.set(id, { sales: 0, paid: 0, count: 0 }); return m.get(id); };
@@ -304,8 +321,10 @@ function moneySummary(f, t) {
     const r = { sales: 0, orders: 0, collectedAtOrder: 0, payments: 0, income: 0, incomeCash: 0, expense: 0, expenseCash: 0, expenseCredit: 0, payroll: 0, byCat: {} };
     for (const o of S.orders.values()) if (o.status !== "cancelled" && inRange(o.date, f, t)) { r.sales += +o.total || 0; r.orders++; r.collectedAtOrder += +o.paidNow || 0; }
     for (const p of S.payments.values()) if (inRange(p.date, f, t)) r.payments += +p.amount || 0;
+    r.supplierPaid = 0;
     for (const x of S.finance.values()) if (inRange(x.date, f, t)) {
       const a = +x.amount || 0;
+      if (x.kind === "supplierPay") { r.supplierPaid += a; continue; }
       if (x.kind === "income") { r.income += a; if (x.payType !== "credit") r.incomeCash += a; }
       else { r.expense += a; if (x.payType === "credit") r.expenseCredit += a; else r.expenseCash += a; r.byCat[x.category] = (r.byCat[x.category] || 0) + a; }
     }
@@ -334,11 +353,11 @@ function fmtVal(k, v) {
 }
 function diff(a, b) {
   const out = []; const keys = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
-  keys.forEach(k => { if (["id","at","no","editedAt","editedBy","ownerUid","username","lastBackup","demo","createdAt","salaryHistory","salary","endMonth","currency"].includes(k)) return; if (JSON.stringify(a?.[k]) !== JSON.stringify(b?.[k])) out.push({ f: k, from: fmtVal(k, a?.[k]), to: fmtVal(k, b?.[k]) }); });
+  keys.forEach(k => { if (["id","at","no","editedAt","editedBy","ownerUid","username","lastBackup","demo","createdAt","onboarded","src","salaryHistory","salary","endMonth","currency"].includes(k)) return; if (JSON.stringify(a?.[k]) !== JSON.stringify(b?.[k])) out.push({ f: k, from: fmtVal(k, a?.[k]), to: fmtVal(k, b?.[k]) }); });
   return out;
 }
 function audit(action, entity, entityId, summary, before, after) {
-  const date = today(); const by = pendingBy || OWNER_ID; pendingBy = null;
+  const date = today(); const by = pendingBy || me().id; pendingBy = null;
   const e = { at: nowISO(), by, action, entity, entityId: entityId || "", summary };
   if (before && after) e.changes = diff(before, after);
   const cur = S.audit.get(date);
@@ -356,10 +375,20 @@ let renderPending = false, renderTimer = null;
 function scheduleRender(now) { if (renderTimer) return; renderTimer = setTimeout(() => { renderTimer = null; render(); }, now ? 0 : 40); }
 document.addEventListener("focusout", () => { if (renderPending) { renderPending = false; setTimeout(render, 0); } });
 let toastTimer;
-function toast(msg) {
+function toast(msg, opts = {}) {
   let t = $("#toast"); if (!t) { t = document.createElement("div"); t.id = "toast"; t.className = "toast"; t.setAttribute("role", "status"); document.body.appendChild(t); }
-  t.textContent = msg; t.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => t.hidden = true, 3600);
+  t.innerHTML = `<span>${esc(msg)}</span>${opts.undo ? `<button type="button" class="toast-btn" id="toast-undo">تراجع</button>` : ""}`;
+  t.hidden = false; clearTimeout(toastTimer); toastTimer = setTimeout(() => t.hidden = true, opts.undo ? 7000 : 4000);
+  if (opts.undo) $("#toast-undo").onclick = () => { t.hidden = true; clearTimeout(toastTimer); opts.undo(); };
 }
+/* Undo the last save: put back what was there before (or remove what was just added). */
+function undoOf(what, col, id, before) {
+  return () => {
+    if (before) Store.put(col, id, before); else Store.remove(col, id);
+    audit("تراجع", col, id, `تراجع عن: ${what}`); toast("تم التراجع");
+  };
+}
+const saved = (msg, col, id, before) => ({ msg, undo: undoOf(msg, col, id, before) });
 const pill = ([label, cls]) => `<span class="pill ${cls || ""}">${esc(label)}</span>`;
 const ICONS = {
   dashboard: '<path d="M3 13h8V3H3zM13 21h8V11h-8zM3 21h8v-6H3zM13 3v6h8V3z"/>',
@@ -381,20 +410,26 @@ const ICONS = {
   logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/>'
 };
 ICONS.payroll = '<rect x="2" y="6" width="20" height="14" rx="2"/><path d="M2 10h20M6 15h4"/><circle cx="16.5" cy="15" r="1.5"/>';
+ICONS.attendance = '<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M8 2v4M16 2v4M3 10h18M8 15l2.5 2.5L16 13"/>';
+ICONS.suppliers = '<path d="M1 7h13v10H1zM14 10h4l4 4v3h-8z"/><circle cx="5.5" cy="18.5" r="1.5"/><circle cx="17.5" cy="18.5" r="1.5"/>';
+ICONS.help = '<circle cx="12" cy="12" r="9.5"/><path d="M9.3 9a2.8 2.8 0 0 1 5.4 1c0 1.9-2.7 2.4-2.7 4"/><circle cx="12" cy="17.3" r=".6"/>';
 ICONS.backup = '<path d="M5 4h11l3 3v13H5z"/><path d="M8 4v5h7V4M8 20v-6h8v6"/>';
 const icon = k => `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[k]}</svg>`;
 const ROUTES = [
-  { id: "dashboard", label: "لوحة التحكم", short: "الرئيسية", ok: () => true },
-  { id: "stock", label: "المخزون والحركة", short: "المخزون", ok: () => true },
+  { id: "dashboard", label: "الرئيسية", short: "الرئيسية", ok: () => true },
+  { id: "stock", label: "المخزون في الغرفة", short: "المخزون", ok: () => true },
   { id: "production", label: "الإنتاج اليومي", short: "الإنتاج", ok: () => can("production") },
   { id: "orders", label: "الأوردرات والفواتير", short: "الأوردرات", ok: () => can("orders") || can("payments") },
-  { id: "customers", label: "العملاء والحسابات", short: "العملاء", ok: () => can("orders") || can("payments") },
-  { id: "payroll", label: "المرتبات", short: "المرتبات", ok: () => true },
-  { id: "finance", label: "المصروفات والإيرادات", short: "المصروفات", ok: () => can("finance") },
-  { id: "count", label: "الجرد الفعلي", short: "الجرد", ok: () => can("count") },
-  { id: "reports", label: "التقارير", short: "التقارير", ok: () => can("reports") },
-  { id: "log", label: "سجل العمليات", short: "السجل", ok: () => can("log") },
-  { id: "admin", label: "الإعدادات", short: "الإعدادات", ok: () => true }
+  { id: "customers", label: "العملاء وحساباتهم", short: "العملاء", ok: () => can("orders") || can("payments") },
+  { id: "payroll", label: "المرتبات", short: "المرتبات", ok: () => isMgr() },
+  { id: "attendance", label: "حضور الموظفين", short: "الحضور", ok: () => isMgr() },
+  { id: "finance", label: "المصروفات", short: "المصروفات", ok: () => can("finance") },
+  { id: "suppliers", label: "الموردين وحساباتهم", short: "الموردين", ok: () => can("finance") },
+  { id: "count", label: "الجرد (عدّ الغرفة)", short: "الجرد", ok: () => can("count") },
+  { id: "reports", label: "التقارير والأرباح", short: "التقارير", ok: () => isMgr() },
+  { id: "log", label: "سجل كل اللي اتعمل", short: "السجل", ok: () => can("log") },
+  { id: "admin", label: "الإعدادات", short: "الإعدادات", ok: () => isMgr() },
+  { id: "help", label: "إزاي أستخدم التطبيق", short: "مساعدة", ok: () => true }
 ];
 const routeOf = id => ROUTES.find(r => r.id === id);
 function go(r) { const replace = modalOpen && modalHistory; route = r; closeModal(true); try { if (replace) history.replaceState(null, "", "#" + r); else if (location.hash !== "#" + r) history.pushState(null, "", "#" + r); } catch {} render(); window.scrollTo(0, 0); }
@@ -433,6 +468,7 @@ function openModal(title, body, opts = {}) {
       const res = await opts.onSubmit(new FormData(form), form);
       if (typeof res === "string") { err.textContent = res; err.hidden = false; btn.disabled = false; return; }
       if (typeof res === "function") { res(); return; }
+      if (res && typeof res === "object" && res.msg) { closeModal(); toast(res.msg, res); return; }
       closeModal(); if (opts.done) toast(opts.done);
     } catch (ex) { console.error(ex); btn.disabled = false; err.textContent = ex && ex.userMessage ? ex.userMessage : "تعذر الحفظ. حاول مرة أخرى."; err.hidden = false; }
   });
@@ -505,12 +541,19 @@ function render() {
   if (MODE === "cloud") {
     if (authUser === undefined) return screenMsg(app, "جاري فتح Pets Home…");
     if (!authUser) return renderLogin(app);
+    if (isWorker()) {
+      if (acct === undefined) return screenMsg(app, "جاري التحقق من الحساب…");
+      if (!acct || acct.active !== true) return renderDenied(app, true);
+    }
     if (Cloud.error === "denied") return renderDenied(app);
     if (!Cloud.started) Cloud.start();
     if (!Cloud.isReady()) return screenMsg(app, "جاري تحميل بيانات المزرعة…");
     if (!cloudBooted) { cloudBooted = true; cloudAfterReady(); }
   }
-  if (!S.meta.get("settings")) return renderWelcome(app);
+  if (!S.meta.get("settings")) {
+    if (isWorker()) { app.innerHTML = `<div class="screen"><div class="card"><div class="logo">Pets Home</div><p>المدير لسه ما جهزش التطبيق. جرّب تاني بعدين.</p><button type="button" class="btn block" data-act="logout">تسجيل الخروج</button></div></div>`; return; }
+    return renderWelcome(app);
+  }
   if (!routeOf(route)?.ok()) route = "dashboard";
   const s = settings(); const r = routeOf(route);
   const tabs = tabsShown();
@@ -518,12 +561,12 @@ function render() {
     <aside class="rail">
       <div class="brand"><span class="name">${esc(s.farmName || "Pets Home")}</span><span class="sub">إدارة المزرعة والمخزون</span></div>
       <nav class="nav" aria-label="الأقسام">${ROUTES.filter(x => x.ok()).map(x => `<a href="#${x.id}" data-go="${x.id}" ${x.id === route ? 'aria-current="page"' : ""}>${icon(x.id)}${x.label}</a>`).join("")}</nav>
-      <div class="who"><div><b>${esc(ownerName())}</b> <span class="muted small">${MODE === "cloud" ? (navigator.onLine === false ? "غير متصل" : "متصل بالسحابة") : "البيانات على هذا الجهاز"}</span></div>
-      <div class="actions">${MODE === "cloud" ? `<button class="btn sm" data-act="account">حسابي</button>` : ""}<button class="btn sm" data-act="backup">نسخة احتياطية</button>${installPrompt ? `<button class="btn sm" data-act="install">تثبيت التطبيق</button>` : ""}</div></div>
+      <div class="who"><div><b>${esc(me().name)}</b> <span class="muted small">${MODE === "cloud" ? (navigator.onLine === false ? "غير متصل" : "متصل بالسحابة") : "البيانات على هذا الجهاز"}</span></div>
+      <div class="actions">${MODE === "cloud" ? `<button class="btn sm" data-act="account">حسابي</button>` : ""}${isMgr() ? `<button class="btn sm" data-act="backup">نسخة احتياطية</button>` : ""}${installPrompt ? `<button class="btn sm" data-act="install">تثبيت التطبيق</button>` : ""}</div></div>
     </aside>
     <div class="col">
       <header class="appbar"><div class="in"><div class="ttl"><span class="farm">${esc(s.farmName || "Pets Home")}</span><span class="page">${esc(r.label)}</span></div>
-      <button class="avatar" data-act="more" aria-label="القائمة">${esc(ownerName().trim().charAt(0) || "P")}</button></div></header>
+      <button class="avatar" data-act="more" aria-label="القائمة">${esc((me().name || "P").trim().charAt(0) || "P")}</button></div></header>
       <main id="main">${MODE === "cloud" && navigator.onLine === false ? `<div class="banner">أنت غير متصل بالإنترنت. سجّل عادي، والتسجيلات هتترفع للسحابة تلقائياً لما النت يرجع.</div>` : ""}${s.demo ? `<div class="banner info">أنت تجرّب ببيانات تجريبية. لما تخلص، امسحها من «الإعدادات ← مسح كل البيانات» وابدأ ببياناتك.</div>` : ""}${VIEWS[route]()}</main>
     </div>
     <nav class="tabbar" aria-label="التنقل">
@@ -536,22 +579,25 @@ function render() {
   afterRender[route]?.();
   if (pendingAction) { const a = pendingAction; pendingAction = null; const qa = quickActions().find(x => x.id === a); if (qa) setTimeout(qa.run, 50); }
 }
-function tabsShown() { return ["dashboard", "stock", "orders"].map(routeOf); }
+function tabsShown() { return ["dashboard", "stock", "orders", "production", "finance", "customers", "count"].map(routeOf).filter(r => r.ok()).slice(0, 3); }
 const tabBtn = r => `<button type="button" data-go="${r.id}" ${r.id === route ? 'aria-current="page"' : ""}>${icon(r.id)}<span>${esc(r.short)}</span></button>`;
 function quickActions() {
   return [
-    { id: "order", label: "أوردر جديد", ic: "orders", run: () => orderForm() },
-    { id: "advance", label: "سلفة لموظف", ic: "payroll", run: () => payEntryForm("advance") },
-    { id: "production", label: "تسجيل إنتاج", ic: "production", run: () => moveForm("production") },
-    { id: "withdraw", label: "سحب من المخزون", ic: "withdraw", run: () => moveForm("withdraw") },
-    { id: "expense", label: "مصروف", ic: "finance", run: () => financeForm("expense") },
-    { id: "payment", label: "تحصيل من عميل", ic: "pay", run: () => paymentForm() },
-    { id: "count", label: "جرد فعلي", ic: "count", run: () => go("count") },
-    { id: "adjust", label: "خصم أو مكافأة", ic: "payroll", run: () => payEntryForm("deduct") },
-    { id: "payout", label: "صرف مرتب", ic: "pay", run: () => payEntryForm("payout") }
-  ];
+    can("orders") && { id: "order", label: "أوردر جديد", ic: "orders", run: () => orderForm() },
+    can("production") && { id: "production", label: "سجّل إنتاج", ic: "production", run: () => moveForm("production") },
+    isMgr() && { id: "advance", label: "سلفة لموظف", ic: "payroll", run: () => payEntryForm("advance") },
+    can("finance") && { id: "expense", label: "مصروف جديد", ic: "finance", run: () => financeForm("expense") },
+    can("withdraw") && { id: "withdraw", label: "سحب من الغرفة", ic: "withdraw", run: () => moveForm("withdraw") },
+    can("payments") && { id: "payment", label: "تحصيل من عميل", ic: "pay", run: () => paymentForm() },
+    isMgr() && { id: "attendance", label: "حضور الموظفين", ic: "attendance", run: () => go("attendance") },
+    isMgr() && { id: "adjust", label: "خصم أو مكافأة", ic: "payroll", run: () => payEntryForm("deduct") },
+    isMgr() && { id: "payout", label: "صرف مرتب", ic: "pay", run: () => payEntryForm("payout") },
+    can("finance") && { id: "supplier-pay", label: "سداد لمورد", ic: "suppliers", run: () => supplierPayForm() },
+    can("count") && { id: "count", label: "جرد الغرفة", ic: "count", run: () => go("count") }
+  ].filter(Boolean);
 }
 function showQuick() {
+  if (!quickActions().length) return toast("حسابك مش مسموح له يسجل حاجة. كلّم المدير.");
   openModal("تسجيل جديد", `<div class="sheet-grid">${quickActions().map(a => `<button type="button" data-quick="${a.id}">${icon(a.ic)}${esc(a.label)}</button>`).join("")}</div>`, { noFooter: true, noFocus: true });
   $$("[data-quick]").forEach(b => b.onclick = () => { const a = quickActions().find(x => x.id === b.dataset.quick); if (a) a.run(); });
 }
@@ -559,9 +605,10 @@ function showMore() {
   const tabs = tabsShown().map(r => r.id);
   const rest = ROUTES.filter(r => !tabs.includes(r.id));
   openModal("المزيد", `<div class="sheet-grid">${rest.map(r => `<button type="button" data-go="${r.id}">${icon(r.id)}${esc(r.label)}</button>`).join("")}
-    <button type="button" data-act="backup">${icon("backup")}نسخة احتياطية</button>
+    ${isMgr() ? `<button type="button" data-act="backup">${icon("backup")}نسخة احتياطية</button>` : ""}
     ${MODE === "cloud" ? `<button type="button" data-act="account">${icon("user")}حسابي</button>` : ""}
-    ${installPrompt ? `<button type="button" data-act="install">${icon("install")}تثبيت التطبيق</button>` : ""}</div>`, { noFooter: true, noFocus: true });
+    ${installPrompt ? `<button type="button" data-act="install">${icon("install")}تثبيت التطبيق</button>` : ""}</div>
+    <div class="fsize"><span>حجم الكلام</span>${fontSizeSeg()}</div>`, { noFooter: true, noFocus: true });
 }
 function screenMsg(app, msg) { app.innerHTML = `<div class="screen"><div class="loading">${esc(msg)}</div></div>`; }
 
@@ -638,39 +685,103 @@ function emptyRow(cols, text) { return `<tr><td colspan="${cols}" class="empty">
 function rowActions(kind, id) { if (!isMgr()) return ""; return `<button class="btn sm" data-act="edit-${kind}" data-id="${id}">تعديل</button> <button class="btn sm danger" data-act="del-${kind}" data-id="${id}">حذف</button>`; }
 
 VIEWS.dashboard = () => {
-  const t = today(); const ss = stockSummary("", "");
-  let plates = 0; const byUnit = {};
-  items().forEach(i => { const b = ss.get(i.id); plates += b.closing; byUnit[i.unit] = (byUnit[i.unit] || 0) + b.closingQ; });
-  const prodToday = [...S.moves.values()].filter(m => m.type === "production" && m.date === t);
-  const prodPlates = prodToday.reduce((a, m) => a + (+m.plates || 0), 0);
+  const t = today(), ss = stockSummary("", ""), ms = moneySummary(t, t);
+  let plates = 0; items().forEach(i => plates += ss.get(i.id).closing);
+  const hour = new Date().getHours(), name = (me().name || "").trim().split(" ")[0];
+  const acts = quickActions().slice(0, 4);
+  const prodToday = [...S.moves.values()].filter(m => m.type === "production" && m.date === t).reduce((a, m) => a + (+m.plates || 0), 0);
   const ordToday = [...S.orders.values()].filter(o => o.date === t && o.status !== "cancelled");
-  const ms = moneySummary(t, t);
-  const low = items().filter(i => (+i.minPlates || 0) > 0 && ss.get(i.id).closing <= +i.minPlates);
-  const recent = allAudit().slice(0, 8);
-  const quick = quickActions().slice(0, 4).map((a, i) => `<button class="btn ${i < 2 ? "primary" : ""}" data-qa="${a.id}">${esc(a.label)}</button>`).join("");
-  return `${headHtml("لوحة التحكم", `${dayName(t)} ${fmtDate(t)}`, `<span class="rail-only">${quick}</span>`)}
-  <section class="kpis" aria-label="ملخص اليوم">
-    <div class="kpi plate"><span>الأطباق في الغرفة الآن</span><b class="num">${nf(plates)}</b><small>${Object.entries(byUnit).map(([u, q]) => `${nf(q)} ${esc(u)}`).join(" · ") || "لا يوجد مخزون مسجل"}</small></div>
-    <div class="kpi"><span>إنتاج اليوم</span><b class="num">${nf(prodPlates)} طبق</b><small>${prodToday.length} تسجيل</small></div>
-    <div class="kpi"><span>أوردرات اليوم</span><b class="num">${ordToday.length}</b><small>${nf(ordToday.reduce((a, o) => a + (o.lines || []).reduce((x, l) => x + (+l.plates || 0), 0), 0))} طبق خارج</small></div>
-    <div class="kpi"><span>مبيعات اليوم</span><b class="num">${money(ms.sales)}</b><small>محصّل ${money(ms.collectedAtOrder)}</small></div>
-    <div class="kpi"><span>مصروفات اليوم</span><b class="num">${money(ms.expense)}</b><small>${ms.expenseCredit ? "منها آجل " + money(ms.expenseCredit) : "نقدي"}</small></div>
-    <div class="kpi"><span>إيرادات أخرى اليوم</span><b class="num">${money(ms.income)}</b><small>تحصيلات عملاء ${money(ms.payments)}</small></div>
-    <div class="kpi hero"><span>صافي حركة اليوم</span><b class="num">${money(ms.net)}</b><small>مبيعات + إيرادات − مصروفات</small></div>
-    <div class="kpi ${totalReceivable() > 0 ? "bad" : ""}"><span>مستحق على العملاء</span><b class="num">${money(totalReceivable())}</b><small>الآجل والمتبقي</small></div>
-  </section>
-  ${uploadBanner()}${backupNag()}${low.length ? `<div class="banner">رصيد منخفض: ${low.map(i => `${esc(i.name)} (${nf(ss.get(i.id).closing)} طبق)`).join("، ")}</div>` : ""}
-  ${monthPanel()}
-  <div class="grid2">
-    <section class="panel"><div class="panel-head"><h2>رصيد الغرفة لكل صنف</h2><a href="#stock" data-go="stock" class="small">تفاصيل الحركة</a></div>
-      <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الصنف</th><th class="n">الأطباق</th><th class="n">الكمية</th><th>الحالة</th></tr></thead><tbody>
-      ${items().length ? items().map(i => { const b = ss.get(i.id); const lowI = (+i.minPlates || 0) > 0 && b.closing <= +i.minPlates; return `<tr><td>${esc(i.name)}</td><td class="n">${nf(b.closing)}</td><td class="n">${qtyStr(b.closingQ, i.id)}</td><td>${b.closing < 0 ? pill(["رصيد بالسالب", "bad"]) : lowI ? pill(["منخفض", "warn"]) : pill(["متاح", "good"])}</td></tr>`; }).join("") : emptyRow(4, isMgr() ? `لا توجد أصناف بعد. <a href="#admin" data-go="admin">أضف أول صنف</a> ثم سجّل رصيده الافتتاحي.` : "لم يضف المدير أصنافاً بعد.")}
-      </tbody></table></div></section>
-    <section class="panel"><div class="panel-head"><h2>آخر العمليات</h2>${can("log") ? `<a href="#log" data-go="log" class="small">السجل الكامل</a>` : ""}</div>
-      ${recent.length ? `<div class="tbl-wrap"><table class="rtable no-title"><thead><tr><th>الوقت</th><th>العملية</th><th>بواسطة</th></tr></thead><tbody>${recent.map(e => `<tr><td class="nowrap small muted">${fmtDT(e.at)}</td><td class="span">${esc(e.summary)}</td><td class="small muted">${esc(wName(e.by))}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">ستظهر هنا كل عملية إنتاج أو بيع أو سحب أو صرف فور تسجيلها.</div>`}
-    </section>
-  </div>`;
+  const kpis = isMgr() ? `
+    <div class="kpi plate"><span>الأطباق في الغرفة دلوقتي</span><b class="num">${nf(plates)}</b><small>${items().length} صنف · <a href="#stock" data-go="stock">التفاصيل</a></small></div>
+    <div class="kpi"><span>مبيعات النهارده</span><b class="num">${money(ms.sales)}</b><small>${ms.orders} أوردر · اتحصّل ${money(r2(ms.collectedAtOrder + ms.payments))}</small></div>
+    <div class="kpi"><span>مصروفات النهارده</span><b class="num">${money(ms.expense)}</b><small>${ms.payroll ? `منها مرتبات وسلف ${money(ms.payroll)}` : "كل اللي اتصرف النهارده"}</small></div>
+    <div class="kpi hero"><span>مكسب النهارده</span><b class="num">${money(ms.net)}</b><small>المبيعات − المصروفات</small></div>` : `
+    <div class="kpi plate"><span>الأطباق في الغرفة دلوقتي</span><b class="num">${nf(plates)}</b><small>${items().length} صنف</small></div>
+    <div class="kpi"><span>إنتاج النهارده</span><b class="num">${nf(prodToday)} طبق</b><small>من كل العمال</small></div>
+    <div class="kpi"><span>أوردرات النهارده</span><b class="num">${ordToday.length}</b><small>${nf(ordToday.reduce((a, o) => a + (o.lines || []).reduce((x, l) => x + (+l.plates || 0), 0), 0))} طبق خرج</small></div>
+    <div class="kpi hero"><span>سجلت النهارده</span><b class="num">${myToday().length}</b><small>تسجيل باسمك</small></div>`;
+  const recent = isMgr() ? allAudit().slice(0, 6) : [];
+  return `<div class="hello"><h1>${hour < 12 ? "صباح الخير" : "مساء الخير"}${name ? ` يا ${esc(name)}` : ""}</h1><div class="sub">${dayName(t)} ${fmtDate(t)}</div></div>
+  ${onboarding()}
+  ${acts.length ? `<section class="bigacts" aria-label="تسجيل سريع">${acts.map(a => `<button type="button" class="bigact" data-qa="${a.id}">${icon(a.ic)}<span>${esc(a.label)}</span></button>`).join("")}</section>` : ""}
+  <section class="kpis" aria-label="النهارده">${kpis}</section>
+  ${attention(ss)}
+  ${isMgr() ? monthPanel() : ""}
+  <section class="panel"><div class="panel-head"><h2>رصيد الغرفة لكل صنف</h2><a href="#stock" data-go="stock" class="small">كل الحركة</a></div>
+    <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الصنف</th><th class="n">الأطباق</th><th class="n">الكمية</th><th>الحالة</th></tr></thead><tbody>
+    ${items().length ? items().map(i => { const b = ss.get(i.id); const lowI = (+i.minPlates || 0) > 0 && b.closing <= +i.minPlates; return `<tr><td>${esc(i.name)}</td><td class="n">${nf(b.closing)}</td><td class="n">${qtyStr(b.closingQ, i.id)}</td><td>${b.closing < 0 ? pill(["بالسالب: راجع التسجيلات", "bad"]) : lowI ? pill(["قرب يخلص", "warn"]) : pill(["موجود", "good"])}</td></tr>`; }).join("") : emptyRow(4, isMgr() ? `لسه مفيش أصناف. ابدأ من قائمة «ابدأ من هنا» فوق.` : "المدير لسه ما ضافش أصناف.")}
+    </tbody></table></div></section>
+  ${isMgr() ? `<section class="panel"><div class="panel-head"><h2>آخر حاجات اتسجلت</h2>${can("log") ? `<a href="#log" data-go="log" class="small">السجل الكامل</a>` : ""}</div>
+    ${recent.length ? `<div class="tbl-wrap"><table class="rtable no-title"><thead><tr><th>الوقت</th><th>اللي اتعمل</th><th>مين</th></tr></thead><tbody>${recent.map(e => `<tr><td class="nowrap small muted">${fmtDT(e.at)}</td><td class="span">${esc(e.summary)}</td><td class="small muted">${esc(wName(e.by))}</td></tr>`).join("")}</tbody></table></div>` : `<div class="empty">أي حاجة هتتسجل هتظهر هنا على طول.</div>`}</section>`
+    : `<section class="panel"><h2>اللي سجلته النهارده</h2>${myToday().length ? `<ul class="todo">${myToday().map(x => `<li><span>${esc(x)}</span></li>`).join("")}</ul>` : `<div class="empty">لسه ما سجلتش حاجة النهارده.</div>`}</section>`}
+  <div class="actions center"><button type="button" class="btn" data-act="day-summary">${icon("orders")} ملخص النهارده على واتساب</button></div>`;
 };
+/* Things registered today under this person's name (shown on an employee's home screen). */
+function myToday() {
+  const t = today(), id = me().id, out = [];
+  for (const m of S.moves.values()) if (m.date === t && m.by === id) out.push(`${KIND[m.type] || m.type}: ${nf(m.plates)} طبق ${itemName(m.itemId)}`);
+  for (const o of S.orders.values()) if (o.date === t && o.by === id && o.status !== "cancelled") out.push(`أوردر ${o.no} — ${custName(o.customerId)}`);
+  for (const p of S.payments.values()) if (p.date === t && p.by === id) out.push(`تحصيل ${money(p.amount)} من ${custName(p.customerId)}`);
+  for (const x of S.finance.values()) if (x.date === t && x.by === id) out.push(`${x.kind === "income" ? "إيراد" : x.kind === "supplierPay" ? "سداد مورد" : "مصروف"} ${money(x.amount)}`);
+  return out;
+}
+/* "Start here": the four things that make the app useful, until they're done. */
+function onboarding() {
+  const s = settings(); if (!isMgr() || s.onboarded) return "";
+  const steps = [
+    { done: items(true).length > 0, t: "ضيف الأصناف اللي بتنتجها", d: "اسم الصنف، الطبق فيه كام كيلو أو عدد، وسعره", act: "new-item" },
+    { done: [...S.moves.values()].some(m => m.type === "opening" || m.type === "production"), t: "سجّل الموجود في الغرفة دلوقتي", d: "عدد الأطباق من كل صنف، مرة واحدة في الأول", act: "new-opening" },
+    { done: workers(true).some(onPayroll), t: "ضيف الموظفين ومرتباتهم", d: "عشان تسجل السلف والخصومات والمرتب يتحسب لوحده", act: "new-worker" },
+    { done: S.orders.size > 0, t: "سجّل أول أوردر", d: "الأطباق هتتخصم من الغرفة والفاتورة هتطلع لوحدها", act: "new-order" }
+  ];
+  const n = steps.filter(x => x.done).length;
+  if (n === steps.length) return "";
+  return `<section class="panel onboard"><div class="panel-head"><h2>ابدأ من هنا</h2><span class="hint">${n} من ${steps.length} خلصوا</span></div>
+    <ol class="steps">${steps.map((x, k) => `<li class="${x.done ? "done" : ""}"><span class="dot">${x.done ? "✓" : k + 1}</span><div><b>${x.t}</b><small>${x.d}</small></div>${x.done ? "" : `<button type="button" class="btn sm primary" data-act="${x.act}">ابدأ</button>`}</li>`).join("")}</ol>
+    <button type="button" class="linkbtn small" data-act="hide-onboard">إخفاء القائمة دي</button></section>`;
+}
+/* "Needs your attention": the few things worth acting on today. */
+function attention(ss) {
+  if (!isMgr()) return "";
+  const rows = [];
+  const low = items().filter(i => (+i.minPlates || 0) > 0 && ss.get(i.id).closing <= +i.minPlates);
+  if (low.length) rows.push(`<li><span>${icon("stock")} قرب يخلص: ${low.map(i => `${esc(i.name)} (${nf(ss.get(i.id).closing)} طبق)`).join("، ")}</span><button type="button" class="btn sm" data-act="new-production">سجّل إنتاج</button></li>`);
+  const debtors = customers().map(c => ({ c, due: (custBalances().get(c.id) || {}).due || 0 })).filter(x => x.due > 0.005).sort((a, b) => b.due - a.due);
+  if (debtors.length) rows.push(`<li><span>${icon("customers")} ${debtors.length} عميل عليهم ${money(r2(debtors.reduce((a, x) => a + x.due, 0)))}: ${debtors.slice(0, 3).map(x => `${esc(x.c.name)} ${nf(x.due)}`).join("، ")}${debtors.length > 3 ? "…" : ""}</span>${remindBtn(debtors[0].c, debtors[0].due, `فكّر ${esc(debtors[0].c.name.split(" ")[0])}`)}<button type="button" class="btn sm" data-go="customers">الكل</button></li>`);
+  const owedSup = [...supplierBalances().values()].reduce((a, v) => a + Math.max(0, v), 0);
+  if (owedSup > 0.005 && can("finance")) rows.push(`<li><span>${icon("suppliers")} عليك للموردين ${money(r2(owedSup))}</span><button type="button" class="btn sm" data-go="suppliers">الموردين</button></li>`);
+  const pm = prevMonth(curMonth()), unpaidPrev = payrollMonth(pm).remaining;
+  if (unpaidPrev > 0.005) rows.push(`<li><span>${icon("payroll")} مرتبات ${MONTHS[+pm.slice(5, 7) - 1]} لسه فيها ${money(unpaidPrev)} ما اتصرفتش</span><button type="button" class="btn sm" data-go="payroll">المرتبات</button></li>`);
+  const extra = uploadBanner() + backupNag();
+  if (!rows.length && !extra) return "";
+  return `${extra}${rows.length ? `<section class="panel"><h2>محتاج انتباهك</h2><ul class="todo">${rows.join("")}</ul></section>` : ""}`;
+}
+/* Ready-made WhatsApp reminder for a customer who owes money. */
+function waNumber(phone) {
+  let d = String(phone || "").replace(/[^\d+]/g, ""); if (d.startsWith("+")) d = d.slice(1); if (d.startsWith("00")) d = d.slice(2);
+  if (/^01\d{9}$/.test(d)) d = "2" + d;
+  return /^\d{10,15}$/.test(d) ? d : "";
+}
+function reminderText(c, due) { return `السلام عليكم يا ${c.name}، بنفكّر حضرتك بالحساب المتبقي لـ${settings().farmName || "Pets Home"}: ${money(due)}. شكراً ليك.`; }
+function remindBtn(c, due, label) {
+  const n = waNumber(c.phone);
+  return n ? `<a class="btn sm" href="https://wa.me/${n}?text=${encodeURIComponent(reminderText(c, due))}" target="_blank" rel="noopener">${label || "فكّره على واتساب"}</a>`
+    : `<button type="button" class="btn sm" data-act="remind" data-id="${c.id}">${label || "رسالة تذكير"}</button>`;
+}
+/* End-of-day summary for WhatsApp. */
+function daySummaryText(day) {
+  const ms = moneySummary(day, day), ss = stockSummary("", ""), L = [];
+  L.push(`${settings().farmName || "Pets Home"} — ملخص ${dayName(day)} ${fmtDate(day)}`, "—".repeat(14));
+  const prod = {}; [...S.moves.values()].filter(m => m.type === "production" && m.date === day).forEach(m => prod[m.itemId] = (prod[m.itemId] || 0) + (+m.plates || 0));
+  L.push(Object.keys(prod).length ? "الإنتاج: " + Object.entries(prod).map(([id, n]) => `${itemName(id)} ${nf(n)} طبق`).join("، ") : "الإنتاج: مفيش");
+  const out = {}; [...S.orders.values()].filter(o => o.date === day && o.status !== "cancelled").forEach(o => (o.lines || []).forEach(l => out[l.itemId] = (out[l.itemId] || 0) + (+l.plates || 0)));
+  L.push(`الأوردرات: ${ms.orders}${Object.keys(out).length ? " (" + Object.entries(out).map(([id, n]) => `${itemName(id)} ${nf(n)} طبق`).join("، ") + ")" : ""}`);
+  const wd = [...S.moves.values()].filter(m => m.type === "withdraw" && m.date === day);
+  if (wd.length) L.push("سحب من الغرفة: " + wd.map(m => `${itemName(m.itemId)} ${nf(m.plates)} (${m.reason || ""})`).join("، "));
+  L.push(`المبيعات: ${money(ms.sales)} · اتحصّل: ${money(r2(ms.collectedAtOrder + ms.payments))}`, `المصروفات: ${money(ms.expense)}${ms.payroll ? ` (منها مرتبات وسلف ${money(ms.payroll)})` : ""}`, `مكسب النهارده: ${money(ms.net)}`);
+  L.push("—".repeat(14), "الرصيد في الغرفة: " + (items().map(i => `${i.name} ${nf(ss.get(i.id).closing)}`).join("، ") || "—"));
+  return L.join("\n");
+}
 function backupNag() {
   if (MODE === "cloud") return "";
   const s = settings(); if (s.demo || recordCount() < 3) return "";
@@ -683,15 +794,15 @@ afterRender.dashboard = () => { $$("[data-qa]").forEach(b => b.onclick = () => q
 let stockItemFilter = "", stockRange = 30;
 VIEWS.stock = () => {
   const ss = stockSummary("", "");
-  const acts = [isMgr() && `<button class="btn" data-act="new-opening">رصيد افتتاحي</button>`, can("withdraw") && `<button class="btn primary" data-act="new-withdraw">سحب من المخزون</button>`].filter(Boolean).join("");
+  const acts = [isMgr() && `<button class="btn" data-act="new-opening">الموجود في الغرفة دلوقتي</button>`, can("withdraw") && `<button class="btn primary" data-act="new-withdraw">سحب من الغرفة</button>`].filter(Boolean).join("");
   const from = stockRange ? addDays(today(), -stockRange + 1) : "";
   const rows = ledger().filter(e => (!stockItemFilter || e.itemId === stockItemFilter) && (!from || e.date >= from)).slice().reverse().slice(0, 300);
-  return `${headHtml("المخزون والحركة", "الرصيد = أول المدة + الإنتاج − المبيعات − المسحوبات ± تسويات الجرد", acts)}
+  return `${headHtml("المخزون في الغرفة", "الرصيد بيتحسب لوحده: اللي كان موجود + الإنتاج − البيع − السحب (± تصحيح الجرد).", acts)}
   <section class="panel"><div class="panel-head"><h2>رصيد كل صنف</h2><span class="hint">بالأطباق</span></div>
     <div class="stack">${items().length ? items().map(i => { const b = ss.get(i.id); return `<div class="logline"><b>${esc(i.name)} <span class="muted small">— الطبق = ${nf(i.perPlate)} ${esc(i.unit)}</span></b>
-      <div class="equation"><span class="t">افتتاحي ${nf(b.opening)}</span><span class="op">+</span><span class="t">إنتاج ${nf(b.production)}</span><span class="op">−</span><span class="t">مبيعات ${nf(b.sale)}</span><span class="op">−</span><span class="t">مسحوبات ${nf(b.withdraw)}</span><span class="op">${b.adjust < 0 ? "−" : "+"}</span><span class="t">تسويات ${nf(Math.abs(b.adjust))}</span><span class="op">=</span><span class="res">${nf(b.closing)} طبق · ${qtyStr(b.closingQ, i.id)}</span></div></div>`; }).join("") : `<div class="empty">لا توجد أصناف بعد.</div>`}</div>
+      <div class="equation"><span class="t">البداية ${nf(b.opening)}</span><span class="op">+</span><span class="t">إنتاج ${nf(b.production)}</span><span class="op">−</span><span class="t">بيع ${nf(b.sale)}</span><span class="op">−</span><span class="t">سحب ${nf(b.withdraw)}</span><span class="op">${b.adjust < 0 ? "−" : "+"}</span><span class="t">تصحيح جرد ${nf(Math.abs(b.adjust))}</span><span class="op">=</span><span class="res">${nf(b.closing)} طبق · ${qtyStr(b.closingQ, i.id)}</span></div></div>`; }).join("") : `<div class="empty">لا توجد أصناف بعد.</div>`}</div>
   </section>
-  <section class="panel"><div class="panel-head"><h2>حركة المخزون</h2></div>
+  <section class="panel"><div class="panel-head"><h2>كل اللي دخل وخرج من الغرفة</h2></div>
     <div class="filters"><label>الصنف<select id="st-item"><option value="">كل الأصناف</option>${itemOptions(stockItemFilter)}</select></label>
     <label>الفترة<select id="st-range">${opt(7, "آخر 7 أيام", stockRange)}${opt(30, "آخر 30 يوم", stockRange)}${opt(90, "آخر 90 يوم", stockRange)}${opt(0, "كل الحركة", stockRange)}</select></label></div>
     <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الصنف</th><th>النوع</th><th>التاريخ</th><th class="n">أطباق</th><th class="n">الكمية</th><th>البيان</th><th>بواسطة</th><th></th></tr></thead><tbody>
@@ -708,7 +819,7 @@ VIEWS.production = () => {
   const from = addDays(today(), -prodDays + 1);
   const list = [...S.moves.values()].filter(m => m.type === "production" && m.date >= from).sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (a.at < b.at ? 1 : -1));
   const byDay = {}; list.forEach(m => (byDay[m.date] = byDay[m.date] || []).push(m));
-  return `${headHtml("الإنتاج اليومي", "كل طبق يُسجل هنا يُضاف فوراً لرصيد الغرفة", `<button class="btn primary" data-act="new-production">+ تسجيل إنتاج</button>`)}
+  return `${headHtml("الإنتاج اليومي", "كل طبق بتسجله هنا بيتضاف لرصيد الغرفة على طول.", `<button class="btn primary" data-act="new-production">+ تسجيل إنتاج</button>`)}
   <section class="panel"><div class="panel-head"><h2>سجل الإنتاج</h2><div class="filters"><label>الفترة<select id="pr-days">${opt(7, "آخر 7 أيام", prodDays)}${opt(14, "آخر 14 يوم", prodDays)}${opt(31, "آخر 31 يوم", prodDays)}${opt(90, "آخر 90 يوم", prodDays)}</select></label></div></div>
   <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الصنف</th><th>الوقت</th><th class="n">أطباق</th><th class="n">الكمية</th><th>ملاحظة</th><th>بواسطة</th><th></th></tr></thead><tbody>
   ${Object.keys(byDay).length ? Object.entries(byDay).map(([d, ms]) => {
@@ -722,18 +833,19 @@ afterRender.production = () => { $("#pr-days").onchange = e => { prodDays = +e.t
 function moveForm(type, existing) {
   if (!items().length) { toast(isMgr() ? "أضف صنفاً أولاً من «الإعدادات»." : "لا توجد أصناف بعد. اطلب من المدير إضافتها."); return; }
   const m = existing || {};
-  const titles = { production: "تسجيل إنتاج", opening: "رصيد افتتاحي", withdraw: "سحب من المخزون", adjust: "تسوية جرد" };
-  const body = `<div class="form">
+  const titles = { production: "تسجيل إنتاج", opening: "الموجود في الغرفة دلوقتي", withdraw: "سحب من الغرفة", adjust: "تصحيح بعد الجرد" };
+  const intro = { production: "سجّل الأطباق اللي اتنتجت ودخلت الغرفة. هتتضاف للرصيد على طول.", opening: "اكتب عدد الأطباق الموجودة في الغرفة دلوقتي من الصنف ده. بتتعمل مرة واحدة في الأول لكل صنف.", withdraw: "لأي أطباق خرجت من الغرفة من غير بيع: تالف، نافق، استخدام داخلي، عينات…", adjust: "" }[type];
+  const body = `${intro && !existing ? `<p class="intro">${intro}</p>` : ""}<div class="form">
     ${field("الصنف", `<select name="itemId" id="f-itemId" required>${itemOptions(m.itemId)}</select>`, "full")}
     ${field(type === "adjust" ? "عدد الأطباق (موجب زيادة / سالب عجز)" : "عدد الأطباق", numInput("plates", m.plates, "required"))}
-    ${field("الكمية", numInput("qty", m.qty), "", `بالـ<span data-unit></span> — تُحسب تلقائياً ويمكن تعديلها`)}
+    ${field("الكمية", numInput("qty", m.qty), "", `بالـ<span data-unit></span>. بتتحسب لوحدها من عدد الأطباق، وتقدر تغيّرها`)}
     ${field("التاريخ", dateInput("date", m.date))}
     ${byField(m.by)}
     ${type === "withdraw" ? field("سبب السحب", `<select name="reason" id="f-reason">${WD_REASONS.map(r => opt(r, r, m.reason)).join("")}</select>`) : ""}
     ${field("ملاحظة", `<input type="text" name="note" id="f-note" value="${esc(m.note || "")}">`, "full")}
     ${type === "withdraw" && !existing ? `<div class="f full small muted" id="wd-bal"></div>` : ""}</div>`;
   const form = openModal((existing ? "تعديل: " : "") + titles[type], body, {
-    submitLabel: existing ? "حفظ التعديل" : "تسجيل", done: existing ? "تم حفظ التعديل" : "تم التسجيل وتحديث المخزون",
+    submitLabel: existing ? "حفظ التعديل" : "سجّل",
     onSubmit: async fd => {
       const plates = fnum(fd, "plates"); let qty = fnum(fd, "qty");
       if (!fv(fd, "itemId")) return "اختر الصنف.";
@@ -741,19 +853,22 @@ function moveForm(type, existing) {
       if (!isFinite(qty)) qty = r2(plates * (+item(fv(fd, "itemId")).perPlate || 0));
       const data = { type, itemId: fv(fd, "itemId"), plates: r2(plates), qty: r2(qty), date: fv(fd, "date") || today(), note: fv(fd, "note"), by: byVal(fd) };
       if (type === "withdraw") data.reason = fv(fd, "reason");
-      const word = { production: "إنتاج", opening: "رصيد افتتاحي", withdraw: "سحب", adjust: "تسوية" }[type];
+      const word = { production: "إنتاج", opening: "رصيد البداية", withdraw: "سحب من الغرفة", adjust: "تصحيح بعد الجرد" }[type];
       const sum = `${word}: ${nf(data.plates)} طبق ${itemName(data.itemId)} (${nf(data.qty)} ${unitOf(data.itemId)})${data.reason ? " — " + data.reason : ""}`;
       if (existing) {
         const next = Object.assign({}, existing, data, { editedAt: nowISO(), editedBy: me().id });
         await Store.put("moves", existing.id, next); audit("تعديل", "move", existing.id, "تعديل " + sum, existing, next);
+        return saved(`اتعدل التسجيل. رصيد ${itemName(data.itemId)} بقى ${nf(balance(data.itemId).closing)} طبق`, "moves", existing.id, existing);
       } else {
         const id = Store.newId();
         await Store.put("moves", id, Object.assign(data, { at: nowISO() })); audit("إضافة", "move", id, sum);
+        const verb = { production: "اتسجل إنتاج", opening: "اتسجل الموجود:", withdraw: "اتسحب", adjust: "اتصحح" }[type];
+        return saved(`${verb} ${nf(data.plates)} طبق ${itemName(data.itemId)}. الرصيد بقى ${nf(balance(data.itemId).closing)} طبق`, "moves", id, null);
       }
     }
   });
   wirePlates(form);
-  const wb = $("#wd-bal"); if (wb) { const upd = () => { const id = form.querySelector("[name=itemId]").value; const b = balance(id); wb.textContent = `الرصيد الحالي: ${nf(b.closing)} طبق (${nf(b.closingQ)} ${unitOf(id)})`; }; form.querySelector("[name=itemId]").addEventListener("change", upd); upd(); }
+  const wb = $("#wd-bal"); if (wb) { const upd = () => { const id = form.querySelector("[name=itemId]").value; const b = balance(id); wb.textContent = `في الغرفة دلوقتي: ${nf(b.closing)} طبق (${nf(b.closingQ)} ${unitOf(id)})`; }; form.querySelector("[name=itemId]").addEventListener("change", upd); upd(); }
 }
 
 let ordFilter = "open", ordDays = 30, ordSearch = "";
@@ -766,8 +881,8 @@ VIEWS.orders = () => {
   if (ordSearch) list = list.filter(o => (o.no || "").includes(ordSearch) || custName(o.customerId).includes(ordSearch));
   list.sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : (a.at < b.at ? 1 : -1));
   let tot = 0, paid = 0; list.forEach(o => { if (o.status !== "cancelled") { tot += +o.total || 0; paid += orderPaid(o); } });
-  const segs = [["open", "مفتوحة"], ["due", "عليها حساب"], ["prepared", "تم التجهيز"], ["delivered", "تم التسليم"], ["cancelled", "ملغاة"], ["all", "الكل"]];
-  return `${headHtml("الأوردرات والفواتير", "كل أوردر يخصم أطباقه من الغرفة تلقائياً ويصدر له فاتورة", [can("orders") && `<button class="btn primary" data-act="new-order">+ أوردر جديد</button>`, can("payments") && `<button class="btn" data-act="new-payment">تحصيل</button>`].filter(Boolean).join(""))}
+  const segs = [["open", "لسه شغالة"], ["due", "عليها فلوس"], ["prepared", "اتجهزت"], ["delivered", "اتسلمت"], ["cancelled", "ملغية"], ["all", "الكل"]];
+  return `${headHtml("الأوردرات والفواتير", "سجّل كل أوردر خارج من المزرعة. الأطباق بتتخصم من الغرفة والفاتورة بتطلع لوحدها.", [can("orders") && `<button class="btn primary" data-act="new-order">+ أوردر جديد</button>`, can("payments") && `<button class="btn" data-act="new-payment">تحصيل</button>`].filter(Boolean).join(""))}
   <section class="panel">
     <div class="seg" role="group" aria-label="حالة الأوردر">${segs.map(([k, l]) => `<button type="button" data-ordf="${k}" aria-pressed="${k === ordFilter}">${l}</button>`).join("")}</div>
     <div class="filters"><label>الفترة<select id="or-days">${opt(7, "آخر 7 أيام", ordDays)}${opt(30, "آخر 30 يوم", ordDays)}${opt(90, "آخر 90 يوم", ordDays)}${opt(0, "كل الأوردرات", ordDays)}</select></label>
@@ -808,10 +923,10 @@ function orderForm(existing) {
     <label class="f" id="newcust" hidden><span>اسم العميل الجديد</span><input type="text" name="newCust" id="f-newCust"></label>
     ${field("التاريخ", dateInput("date", o.date))}
     ${byField(o.by)}
-    ${field("حالة التجهيز", `<select name="status" id="f-status">${opt("prepared", "تم التجهيز", o.status)}${opt("delivered", "تم التسليم", o.status)}</select>`)}
+    ${field("الأوردر", `<select name="status" id="f-status">${opt("prepared", "اتجهز ولسه ما اتسلمش", o.status)}${opt("delivered", "اتسلم للعميل", o.status)}</select>`)}
     <div class="f full"><span class="small muted" style="font-weight:600">الأصناف</span><div class="lines" id="lines">${(o.lines || [{}]).map((l, i) => lineHtml(l, i)).join("")}</div><button type="button" class="btn sm" id="addline" style="align-self:flex-start">+ صنف آخر</button></div>
-    ${field("خصم", numInput("discount", o.discount || ""))}
-    ${field("المدفوع الآن", numInput("paidNow", existing ? o.paidNow : ""), "", "اتركه فارغاً لو البيع آجل بالكامل")}
+    ${field("خصم (لو في)", numInput("discount", o.discount || ""))}
+    ${field("العميل دفع كام دلوقتي؟", numInput("paidNow", existing ? o.paidNow : ""), "", "سيبه فاضي لو هيدفع بعدين (آجل)")}
     ${field("ملاحظة", `<input type="text" name="note" id="f-note" value="${esc(o.note || "")}">`, "full")}
     <div class="f full"><div class="sum-box"><div><span>إجمالي الأصناف</span><b class="num" id="s-sub">0</b></div><div class="big"><span>بعد الخصم</span><b class="num" id="s-tot">0</b></div><div><span>المتبقي على العميل</span><b class="num" id="s-rem">0</b></div></div></div></div>`;
   const form = openModal(existing ? `تعديل أوردر ${o.no}` : "أوردر جديد", body, {
@@ -849,6 +964,7 @@ function orderForm(existing) {
         const id = Store.newId(); const no = newOrderNo(data.date);
         await Store.put("orders", id, Object.assign(data, { no, at: nowISO() }));
         audit("إضافة", "order", id, `أوردر ${no} — ${custName(customerId)}: ${desc} بإجمالي ${money(total)}${paidNow ? "، مدفوع " + money(paidNow) : "، آجل"}`);
+        toast(`اتسجل الأوردر بـ${money(total)}. الأطباق اتخصمت من الغرفة`, { undo: undoOf(`أوردر ${no}`, "orders", id, null) });
         return () => showInvoice(id);
       }
     }
@@ -932,14 +1048,15 @@ function paymentForm(preset = {}, existing) {
     ${field("طريقة الدفع", `<select name="method" id="f-method">${["نقدي", "تحويل / محفظة", "شيك"].map(x => opt(x, x, p.method)).join("")}</select>`)}
     ${field("ملاحظة", `<input type="text" name="note" id="f-note" value="${esc(p.note || "")}">`)}</div>`;
   const form = openModal(existing ? "تعديل تحصيل" : "تحصيل من عميل", body, {
-    submitLabel: existing ? "حفظ التعديل" : "تسجيل التحصيل", done: existing ? "تم حفظ التعديل" : "تم تسجيل التحصيل",
+    submitLabel: existing ? "حفظ التعديل" : "سجّل التحصيل",
     onSubmit: async fd => {
       const amount = fnum(fd, "amount"); if (!isFinite(amount) || amount <= 0) return "اكتب مبلغاً أكبر من صفر.";
       const data = { customerId: fv(fd, "customerId"), orderId: fv(fd, "orderId"), amount: r2(amount), date: fv(fd, "date") || today(), method: fv(fd, "method"), note: fv(fd, "note"), by: byVal(fd) };
       if (data.orderId) { const o = S.orders.get(data.orderId); const rem = r2(o.total - orderPaid(o) + (existing?.orderId === o.id ? +existing.amount : 0)); if (amount > rem + 0.005) return `المتبقي على هذا الأوردر ${money(rem)} فقط. اختر «دفعة على الحساب» لتسجيل مبلغ أكبر.`; }
       const sum = `تحصيل ${money(data.amount)} من ${custName(data.customerId)}${data.orderId ? " على أوردر " + S.orders.get(data.orderId).no : ""} (${data.method})`;
-      if (existing) { const next = Object.assign({}, existing, data, { editedAt: nowISO(), editedBy: me().id }); await Store.put("payments", existing.id, next); audit("تعديل", "payment", existing.id, "تعديل " + sum, existing, next); }
-      else { const id = Store.newId(); await Store.put("payments", id, Object.assign(data, { at: nowISO() })); audit("إضافة", "payment", id, sum); }
+      const left = () => { const d = custBalances().get(data.customerId); return d && d.due > 0.005 ? `باقي عليه ${money(d.due)}` : "حسابه بقى خالص"; };
+      if (existing) { const next = Object.assign({}, existing, data, { editedAt: nowISO(), editedBy: me().id }); await Store.put("payments", existing.id, next); audit("تعديل", "payment", existing.id, "تعديل " + sum, existing, next); return saved(`اتعدل التحصيل. ${left()}`, "payments", existing.id, existing); }
+      else { const id = Store.newId(); await Store.put("payments", id, Object.assign(data, { at: nowISO() })); audit("إضافة", "payment", id, sum); return saved(`اتسجل تحصيل ${money(data.amount)} من ${custName(data.customerId)}. ${left()}`, "payments", id, null); }
     }
   });
   const cs = form.querySelector("[name=customerId]"), os = form.querySelector("[name=orderId]");
@@ -952,11 +1069,11 @@ VIEWS.customers = () => {
   const cb = custBalances();
   let list = customers(); if (custSearch) list = list.filter(c => (c.name || "").includes(custSearch) || (c.phone || "").includes(custSearch));
   const cash = cb.get("");
-  return `${headHtml("العملاء والحسابات", `المستحق على العملاء: <b class="money">${money(totalReceivable())}</b>`, [can("orders") && `<button class="btn primary" data-act="new-customer">+ عميل جديد</button>`, can("payments") && `<button class="btn" data-act="new-payment">تحصيل</button>`].filter(Boolean).join(""))}
+  return `${headHtml("العملاء وحساباتهم", `فلوس لينا عند العملاء: <b class="money">${money(totalReceivable())}</b>`, [can("orders") && `<button class="btn primary" data-act="new-customer">+ عميل جديد</button>`, can("payments") && `<button class="btn" data-act="new-payment">تحصيل</button>`].filter(Boolean).join(""))}
   <section class="panel"><div class="filters"><label>بحث<input type="search" id="cu-q" placeholder="اسم أو تليفون" value="${esc(custSearch)}"></label></div>
-  <div class="tbl-wrap"><table class="rtable"><thead><tr><th>العميل</th><th>التليفون</th><th class="n">أوردرات</th><th class="n">المشتريات</th><th class="n">المدفوع</th><th class="n">المتبقي عليه</th><th></th></tr></thead><tbody>
+  <div class="tbl-wrap"><table class="rtable"><thead><tr><th>العميل</th><th>التليفون</th><th class="n">أوردرات</th><th class="n">المشتريات</th><th class="n">المدفوع</th><th class="n">عليه لسه</th><th></th></tr></thead><tbody>
   ${list.length ? list.map(c => { const r = cb.get(c.id) || { sales: 0, paid: 0, due: 0, count: 0 }; return `<tr><td><b>${esc(c.name)}</b>${c.note ? ` <span class="small muted">${esc(c.note)}</span>` : ""}</td><td class="nowrap" dir="ltr" style="text-align:start">${esc(c.phone || "—")}</td><td class="n">${r.count}</td><td class="n">${nf(r.sales)}</td><td class="n">${nf(r.paid)}</td><td class="n ${r.due > 0.005 ? "neg" : ""}"><b>${nf(r.due)}</b></td>
-  <td class="nowrap"><button class="btn sm" data-act="statement" data-id="${c.id}">كشف حساب</button>${r.due > 0.005 && can("payments") ? ` <button class="btn sm" data-act="pay-cust" data-id="${c.id}">تحصيل</button>` : ""}${c.phone ? ` <a class="btn sm" href="tel:${esc(c.phone)}">اتصال</a>` : ""}${isMgr() || can("orders") ? ` <button class="btn sm" data-act="edit-customer" data-id="${c.id}">تعديل</button>` : ""}</td></tr>`; }).join("") : emptyRow(7, "لا يوجد عملاء بعد. يمكنك إضافة العميل من هنا أو أثناء تسجيل الأوردر.")}
+  <td class="nowrap"><button class="btn sm" data-act="statement" data-id="${c.id}">كشف حساب</button>${r.due > 0.005 && can("payments") ? ` <button class="btn sm" data-act="pay-cust" data-id="${c.id}">تحصيل</button>` : ""}${r.due > 0.005 ? ` ${remindBtn(c, r.due)}` : ""}${c.phone ? ` <a class="btn sm" href="tel:${esc(c.phone)}">اتصال</a>` : ""}${isMgr() || can("orders") ? ` <button class="btn sm" data-act="edit-customer" data-id="${c.id}">تعديل</button>` : ""}</td></tr>`; }).join("") : emptyRow(7, "لا يوجد عملاء بعد. يمكنك إضافة العميل من هنا أو أثناء تسجيل الأوردر.")}
   ${cash && !custSearch ? `<tr><td class="muted">مبيعات نقدية بدون اسم</td><td>—</td><td class="n">${cash.count}</td><td class="n">${nf(cash.sales)}</td><td class="n">${nf(cash.paid)}</td><td class="n">${nf(cash.due)}</td><td></td></tr>` : ""}
   </tbody></table></div></section>`;
 };
@@ -1006,33 +1123,39 @@ VIEWS.finance = () => {
   const ms = moneySummary(from, "");
   const cats = Object.entries(ms.byCat).sort((a, b) => b[1] - a[1]);
   const maxCat = Math.max(1, ...cats.map(c => c[1]));
-  return `${headHtml("المصروفات والإيرادات", "كل مصروفات المزرعة مقسمة على بنود، نقدي أو آجل", `<button class="btn primary" data-act="new-expense">+ مصروف</button><button class="btn" data-act="new-income">+ إيراد آخر</button>`)}
-  <div class="kpis"><div class="kpi"><span>مصروفات الفترة</span><b class="num">${money(ms.expense)}</b><small>منها آجل ${money(ms.expenseCredit)}</small></div><div class="kpi"><span>إيرادات أخرى</span><b class="num">${money(ms.income)}</b><small>غير المبيعات</small></div><div class="kpi"><span>مبيعات الفترة</span><b class="num">${money(ms.sales)}</b><small>${ms.orders} أوردر</small></div><div class="kpi hero"><span>الصافي</span><b class="num">${money(ms.net)}</b><small>مبيعات + إيرادات − مصروفات</small></div></div>
+  return `${headHtml("المصروفات", "كل فلوس بتتصرف على المزرعة، كاش أو آجل (لسه ما اتدفعتش). البيع للعملاء بيتسجل من الأوردرات.", `<button class="btn primary" data-act="new-expense">+ مصروف</button><button class="btn" data-act="new-income">+ إيراد آخر</button>`)}
+  <div class="kpis"><div class="kpi"><span>مصروفات الفترة</span><b class="num">${money(ms.expense)}</b><small>منها آجل ${money(ms.expenseCredit)}</small></div><div class="kpi"><span>إيرادات أخرى</span><b class="num">${money(ms.income)}</b><small>غير المبيعات</small></div><div class="kpi"><span>مبيعات الفترة</span><b class="num">${money(ms.sales)}</b><small>${ms.orders} أوردر</small></div><div class="kpi hero"><span>المكسب</span><b class="num">${money(ms.net)}</b><small>المبيعات والإيرادات − المصروفات</small></div></div>
   <div class="grid-side">
   <section class="panel"><div class="seg" role="group" aria-label="النوع">${[["all", "الكل"], ["expense", "مصروفات"], ["income", "إيرادات"], ["credit", "آجل"]].map(([k, l]) => `<button type="button" data-fink="${k}" aria-pressed="${k === finKind}">${l}</button>`).join("")}</div>
   <div class="filters"><label>الفترة<select id="fi-days">${opt(1, "اليوم", finDays)}${opt(7, "آخر 7 أيام", finDays)}${opt(31, "آخر 31 يوم", finDays)}${opt(90, "آخر 90 يوم", finDays)}${opt(0, "الكل", finDays)}</select></label></div>
   <div class="tbl-wrap"><table class="rtable"><thead><tr><th>البند</th><th class="n">المبلغ</th><th>التاريخ</th><th>الدفع</th><th>البيان</th><th>بواسطة</th><th></th></tr></thead><tbody>
-  ${list.length ? list.map(x => `<tr><td>${esc(x.category)} ${x.kind === "income" ? pill(["إيراد", "good"]) : ""}</td><td class="n ${x.kind === "income" ? "pos" : "neg"}">${sgn((x.kind === "income" ? "+" : "−") + nf(x.amount))}</td><td class="nowrap">${fmtDate(x.date)}</td><td>${x.payType === "credit" ? pill(["آجل", "warn"]) : "نقدي"}</td><td class="small">${esc(x.note || "") || "—"}</td><td class="small muted">${esc(wName(x.by))}</td><td class="nowrap">${x._pe ? `<button class="btn sm" data-go="payroll">المرتبات</button>` : rowActions("fin", x.id)}</td></tr>`).join("") : emptyRow(7, "لا توجد مصروفات أو إيرادات في هذه الفترة.")}
+  ${list.length ? list.map(x => `<tr><td>${x.kind === "supplierPay" ? `سداد لـ${esc(supplierName(x.supplierId))} ${pill(["سداد مورد", "acc"])}` : `${esc(x.category)} ${x.kind === "income" ? pill(["إيراد", "good"]) : ""}${x.supplierId ? ` <span class="small muted">${esc(supplierName(x.supplierId))}</span>` : ""}`}</td><td class="n ${x.kind === "income" ? "pos" : "neg"}">${sgn((x.kind === "income" ? "+" : "−") + nf(x.amount))}</td><td class="nowrap">${fmtDate(x.date)}</td><td>${x.payType === "credit" ? pill(["آجل", "warn"]) : "كاش"}</td><td class="small">${esc(x.note || "") || "—"}</td><td class="small muted">${esc(wName(x.by))}</td><td class="nowrap">${x._pe ? `<button class="btn sm" data-go="payroll">المرتبات</button>` : rowActions("fin", x.id)}</td></tr>`).join("") : emptyRow(7, "لا توجد مصروفات أو إيرادات في هذه الفترة.")}
   </tbody></table></div></section>
   <section class="panel"><h2>المصروفات حسب البند</h2>${cats.length ? cats.map(([c, v]) => `<div class="logline"><div style="display:flex;justify-content:space-between;gap:8px"><span>${esc(c)}</span><b class="num">${nf(v)}</b></div><div class="bar"><i style="width:${(v / maxCat * 100).toFixed(1)}%"></i></div></div>`).join("") : `<div class="empty">لا مصروفات في الفترة.</div>`}</section></div>`;
 };
 afterRender.finance = () => { $$("[data-fink]").forEach(b => b.onclick = () => { finKind = b.dataset.fink; render(); }); $("#fi-days").onchange = e => { finDays = +e.target.value; e.target.blur(); render(); }; };
 function financeForm(kind, existing) {
+  setTimeout(() => { const ss = $("#f-supplierId"); if (ss) ss.onchange = () => { $("#newsup").hidden = ss.value !== "__new"; if (ss.value === "__new") $("#f-newSupplier").focus(); }; }, 0);
   const x = existing || {}; const cats = kind === "income" ? INC_CATS : EXP_CATS;
   openModal((existing ? "تعديل " : "") + (kind === "income" ? "إيراد آخر" : "مصروف"), `<div class="form">
     ${field("البند", `<select name="category" id="f-category">${cats.map(c => opt(c, c, x.category)).join("")}${x.category && !cats.includes(x.category) ? opt(x.category, x.category, x.category) : ""}</select>`)}
     ${field("المبلغ", numInput("amount", x.amount, "required"))}
     ${field("التاريخ", dateInput("date", x.date))}
     ${byField(x.by)}
-    ${field("الدفع", `<select name="payType" id="f-payType">${opt("cash", "نقدي", x.payType)}${opt("credit", "آجل", x.payType)}</select>`)}
+    ${field("الدفع", `<select name="payType" id="f-payType">${opt("cash", "كاش (اتدفع دلوقتي)", x.payType)}${opt("credit", "آجل (لسه ما اتدفعش)", x.payType)}</select>`)}
+    ${kind === "income" ? "" : field("المورد (اختياري)", `<select name="supplierId" id="f-supplierId">${opt("", "—", x.supplierId)}${suppliers().map(v => opt(v.id, v.name, x.supplierId)).join("")}${opt("__new", "+ مورد جديد…", "")}</select>`, "", "اختار المورد في الشراء الآجل عشان تعرف عليك كام لكل مورد")}
+    <label class="f" id="newsup" hidden><span>اسم المورد الجديد</span><input type="text" name="newSupplier" id="f-newSupplier"></label>
     ${field("البيان", `<input type="text" name="note" id="f-note" value="${esc(x.note || "")}" placeholder="مثال: 3 شكاير ردة">`, "full")}</div>`, {
-    done: existing ? "تم حفظ التعديل" : "تم التسجيل",
     onSubmit: async fd => {
       const amount = fnum(fd, "amount"); if (!isFinite(amount) || amount <= 0) return "اكتب مبلغاً أكبر من صفر.";
       const data = { kind, category: fv(fd, "category"), amount: r2(amount), date: fv(fd, "date") || today(), payType: fv(fd, "payType"), note: fv(fd, "note"), by: byVal(fd) };
-      const sum = `${kind === "income" ? "إيراد" : "مصروف"} ${data.category}: ${money(data.amount)}${data.payType === "credit" ? " (آجل)" : ""}${data.note ? " — " + data.note : ""}`;
-      if (existing) { const next = Object.assign({}, existing, data, { editedAt: nowISO(), editedBy: me().id }); await Store.put("finance", existing.id, next); audit("تعديل", "finance", existing.id, "تعديل " + sum, existing, next); }
-      else { const id = Store.newId(); await Store.put("finance", id, Object.assign(data, { at: nowISO() })); audit("إضافة", "finance", id, sum); }
+      let sid = fv(fd, "supplierId");
+      if (sid === "__new") { const nm = fv(fd, "newSupplier"); if (!nm) return "اكتب اسم المورد الجديد."; sid = Store.newId(); await Store.put("suppliers", sid, { name: nm, phone: "", note: "", at: nowISO() }); audit("إضافة", "supplier", sid, `إضافة مورد ${nm}`); }
+      if (sid) data.supplierId = sid;
+      const sum = `${kind === "income" ? "إيراد" : "مصروف"} ${data.category}: ${money(data.amount)}${data.payType === "credit" ? " (آجل)" : ""}${sid ? " — " + supplierName(sid) : ""}${data.note ? " — " + data.note : ""}`;
+      const tail = data.payType === "credit" && sid ? `. عليك لـ${supplierName(sid)} ${money(supplierBalances().get(sid) || 0)}` : "";
+      if (existing) { const next = Object.assign({}, existing, data, { editedAt: nowISO(), editedBy: me().id }); if (!sid) delete next.supplierId; await Store.put("finance", existing.id, next); audit("تعديل", "finance", existing.id, "تعديل " + sum, existing, next); return saved("اتعدل التسجيل" + tail, "finance", existing.id, existing); }
+      else { const id = Store.newId(); await Store.put("finance", id, Object.assign(data, { at: nowISO() })); audit("إضافة", "finance", id, sum); return saved(`اتسجل ${kind === "income" ? "إيراد" : "مصروف"} ${data.category} ${money(data.amount)}${tail}`, "finance", id, null); }
     }
   });
 }
@@ -1042,7 +1165,7 @@ VIEWS.count = () => {
   const ss = stockSummary("", "");
   const hist = [...S.counts.values()].sort((a, b) => a.at < b.at ? 1 : -1).slice(0, 20);
   const diffHtml = d => d == null || isNaN(d) ? "—" : d === 0 ? pill(["مطابق", "good"]) : d < 0 ? `<span class="neg">عجز ${nf(-d)}</span>` : `<span class="pos">زيادة ${nf(d)}</span>`;
-  return `${headHtml("الجرد الفعلي", "اكتب عدد الأطباق الموجود فعلاً في الغرفة، والسيستم يظهر العجز أو الزيادة")}
+  return `${headHtml("الجرد (عدّ الغرفة)", "عدّ الأطباق اللي في الغرفة فعلاً واكتب العدد. التطبيق هيقولك لو في نقص أو زيادة عن اللي متسجل.")}
   <section class="panel"><div class="panel-head"><h2>جرد اليوم ${fmtDate(today())}</h2><span class="hint">اترك الخانة فارغة للأصناف التي لم تُعد</span></div>
   <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الصنف</th><th class="n">رصيد السيستم</th><th>الموجود فعلاً</th><th class="n">الفرق</th></tr></thead><tbody>
   ${items().length ? items().map(i => { const sys = ss.get(i.id).closing; const v = countDraft[i.id] ?? ""; const d = v === "" ? null : r2(pnum(v) - sys);
@@ -1124,7 +1247,7 @@ function monthReport(ym) {
     items(true).forEach(i => { const b = ss.get(i.id); if (b && b.closing > 0) stockValue += saleValue(i.id, b.closing, b.closingQ); });
     return { ym, from, to, ms, revenue, net, margin: revenue > 0 ? net / revenue * 100 : null, owed: r2(owed), discounts: r2(discounts), byItem,
       prodPlates: r2(prodPlates), wdPlates: r2(wdPlates), wdValue: r2(wdValue), stockValue: r2(stockValue),
-      cashIn: r2(ms.collectedAtOrder + ms.payments + ms.incomeCash), cashOut: r2(ms.expenseCash), done: to < today() };
+      cashIn: r2(ms.collectedAtOrder + ms.payments + ms.incomeCash), cashOut: r2(ms.expenseCash + (ms.supplierPaid || 0)), done: to < today() };
   });
 }
 function monthText(ym) {
@@ -1245,7 +1368,7 @@ const REPORTS = {
     <h2>حسب العميل</h2><div class="tbl-wrap"><table class="rtable"><thead><tr><th>العميل</th><th class="n">أوردرات</th><th class="n">القيمة</th><th class="n">المدفوع</th><th class="n">المتبقي</th></tr></thead><tbody>${Object.keys(byCust).length ? Object.entries(byCust).sort((a, b) => b[1].v - a[1].v).map(([id, r]) => `<tr><td>${esc(custName(id))}</td><td class="n">${r.n}</td><td class="n">${nf(r.v)}</td><td class="n">${nf(r.paid)}</td><td class="n">${nf(r2(r.v - r.paid))}</td></tr>`).join("") : emptyRow(5, "—")}</tbody></table></div>`;
   },
   expenses() {
-    const list = [...S.finance.values(), ...payrollCashRows()].filter(x => x.kind !== "income" && inRange(x.date, rp.from, rp.to)).sort((a, b) => a.date < b.date ? -1 : 1);
+    const list = [...S.finance.values(), ...payrollCashRows()].filter(x => x.kind === "expense" && inRange(x.date, rp.from, rp.to)).sort((a, b) => a.date < b.date ? -1 : 1);
     const cats = {}; list.forEach(x => (cats[x.category] = cats[x.category] || []).push(x));
     const sum = xs => xs.reduce((s, x) => s + +x.amount, 0);
     return `<h2>المصروفات حسب البند — ${money(sum(list))}</h2>${Object.keys(cats).length ? Object.entries(cats).sort((a, b) => sum(b[1]) - sum(a[1])).map(([c, xs]) => `<div class="tbl-wrap"><table class="rtable no-title"><thead><tr><th>${esc(c)}</th><th>البيان</th><th>الدفع</th><th class="n">${nf(sum(xs))}</th></tr></thead><tbody>${xs.map(x => `<tr><td class="nowrap" data-label="التاريخ">${fmtDate(x.date)}</td><td>${esc(x.note || "—")}</td><td>${x.payType === "credit" ? pill(["آجل", "warn"]) : "نقدي"}</td><td class="n" data-label="المبلغ">${nf(x.amount)}</td></tr>`).join("")}</tbody></table></div>`).join("") : `<div class="empty">لا مصروفات في الفترة.</div>`}`;
@@ -1269,7 +1392,7 @@ const REPORTS = {
     for (const o of S.orders.values()) if (o.status !== "cancelled" && +o.paidNow) rows.push({ date: o.date, at: o.at, desc: `مدفوع مع أوردر ${o.no} — ${custName(o.customerId)}`, inn: +o.paidNow, out: 0 });
     for (const p of S.payments.values()) rows.push({ date: p.date, at: p.at, desc: `تحصيل من ${custName(p.customerId)} (${p.method || "نقدي"})`, inn: +p.amount, out: 0 });
     for (const p of payrollCashRows()) rows.push({ date: p.date, at: p.at, desc: `مرتبات: ${p.note}`, inn: 0, out: +p.amount });
-    for (const x of S.finance.values()) if (x.payType !== "credit") rows.push({ date: x.date, at: x.at, desc: `${x.kind === "income" ? "إيراد" : "مصروف"} ${x.category}${x.note ? " — " + x.note : ""}`, inn: x.kind === "income" ? +x.amount : 0, out: x.kind === "income" ? 0 : +x.amount });
+    for (const x of S.finance.values()) if (x.payType !== "credit") rows.push({ date: x.date, at: x.at, desc: x.kind === "supplierPay" ? `سداد لمورد: ${supplierName(x.supplierId)}${x.note ? " — " + x.note : ""}` : `${x.kind === "income" ? "إيراد" : "مصروف"} ${x.category}${x.note ? " — " + x.note : ""}`, inn: x.kind === "income" ? +x.amount : 0, out: x.kind === "income" ? 0 : +x.amount });
     rows.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.at || "") < (b.at || "") ? -1 : 1);
     let bal = 0, opening = 0, ti = 0, to = 0; const out = [];
     rows.forEach(r => { bal = r2(bal + r.inn - r.out); if (r.date < rp.from) opening = bal; else if (r.date <= rp.to) { ti += r.inn; to += r.out; out.push(Object.assign(r, { bal })); } });
@@ -1301,7 +1424,7 @@ VIEWS.log = () => {
   let list = (all || []).filter(e => { const d = localDay(e.at); return d >= lg.from && d <= lg.to; });
   if (lg.worker) list = list.filter(e => (e.by || OWNER_ID) === lg.worker);
   if (lg.q) list = list.filter(e => (e.summary || "").includes(lg.q));
-  return `${headHtml("سجل العمليات", "كل عملية محفوظة بوقتها والعامل المسؤول. التعديلات تظهر بالقيمة القديمة والجديدة.")}
+  return `${headHtml("سجل كل اللي اتعمل", "كل تسجيل محفوظ بوقته واسم اللي عمله. لو حاجة اتعدلت، بتشوف القيمة القديمة والجديدة.")}
   <section class="panel"><div class="filters"><label>من<input type="date" id="lg-from" value="${lg.from}"></label><label>إلى<input type="date" id="lg-to" value="${lg.to}"></label>
   <label>العامل<select id="lg-w">${opt("", "الكل", lg.worker)}${opt(OWNER_ID, ownerName(), lg.worker)}${workers(true).map(w => opt(w.id, w.name, lg.worker)).join("")}</select></label>
   <label>بحث<input type="search" id="lg-q" placeholder="عميل، صنف، رقم أوردر" value="${esc(lg.q)}"></label></div>
@@ -1319,20 +1442,21 @@ afterRender.log = () => {
 
 VIEWS.admin = () => {
   const ss = stockSummary("", ""); const s = settings();
-  return `${headHtml("الإعدادات", "الأصناف وأوزان الأطباق والأسعار، العمال، والنسخ الاحتياطي")}
+  return `${headHtml("الإعدادات", "الأصناف وأسعارها، الموظفين وحسابات دخولهم، وحجم الكلام.")}
   <section class="panel"><div class="panel-head"><h2>الأصناف</h2><button class="btn primary" data-act="new-item">+ صنف جديد</button></div>
   <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الصنف</th><th class="n">الطبق =</th><th class="n">السعر</th><th class="n">تنبيه عند</th><th class="n">الرصيد</th><th>الحالة</th><th></th></tr></thead><tbody>
   ${items(true).length ? items(true).map(i => `<tr><td><b>${esc(i.name)}</b></td><td class="n">${nf(i.perPlate)} ${esc(i.unit)}</td><td class="n">${nf(i.price)} / ${i.priceBasis === "unit" ? esc(i.unit) : "طبق"}</td><td class="n">${+i.minPlates ? nf(i.minPlates) + " طبق" : "—"}</td><td class="n">${nf(ss.get(i.id)?.closing || 0)} طبق</td><td>${i.active === false ? pill(["موقوف"]) : pill(["نشط", "good"])}</td><td class="nowrap"><button class="btn sm" data-act="edit-item" data-id="${i.id}">تعديل</button></td></tr>`).join("") : emptyRow(7, "أضف أصناف المزرعة مع وزن أو عدد الطبق الواحد وسعره.")}
-  </tbody></table></div><p class="small muted">بعد إضافة الصنف، سجّل الموجود حالياً في الغرفة من «المخزون ← رصيد افتتاحي».</p></section>
-  <section class="panel"><div class="panel-head"><h2>العمال والموظفين</h2><button class="btn primary" data-act="new-worker">+ موظف</button></div>
-  <p class="small muted">أسماء العمال تظهر في خانة «العامل المسؤول» عند التسجيل. المرتبات والسلف والخصومات من صفحة «المرتبات».</p>
-  <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الاسم</th><th>التليفون</th><th class="n">المرتب</th><th>الحالة</th><th></th></tr></thead><tbody>
-  ${workers(true).length ? workers(true).map(w => `<tr><td><b>${esc(w.name)}</b></td><td dir="ltr" style="text-align:start">${esc(w.phone || "—")}</td><td class="n">${onPayroll(w) ? money(salaryFor(w, curMonth())) : "—"}</td><td>${w.active === false ? pill(["موقوف"]) : pill(["نشط", "good"])}</td><td class="nowrap"><button class="btn sm" data-act="edit-worker" data-id="${w.id}">تعديل</button> <button class="btn sm" data-act="worker-log" data-id="${w.id}">حركاته</button></td></tr>`).join("") : emptyRow(5, "لم تضف موظفين بعد.")}
+  </tbody></table></div><p class="small muted">بعد ما تضيف الصنف، سجّل الموجود منه في الغرفة من «المخزون ← الموجود في الغرفة دلوقتي».</p></section>
+  <section class="panel"><div class="panel-head"><h2>الموظفين وحسابات الدخول</h2><button class="btn primary" data-act="new-worker">+ موظف</button></div>
+  <p class="small muted">${MODE === "cloud" ? "اعمل لأي موظف «حساب دخول» عشان يسجل من موبايله. هيشوف بس اللي تسمح له بيه، ومش هيشوف المرتبات ولا الأرباح." : "حسابات دخول الموظفين بتشتغل لما السحابة تكون شغالة."} المرتبات والسلف من صفحة «المرتبات».</p>
+  <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الاسم</th><th>التليفون</th><th class="n">المرتب</th>${MODE === "cloud" ? "<th>حساب الدخول</th>" : ""}<th>الحالة</th><th></th></tr></thead><tbody>
+  ${workers(true).length ? workers(true).map(w => `<tr><td><b>${esc(w.name)}</b></td><td dir="ltr" style="text-align:start">${esc(w.phone || "—")}</td><td class="n">${onPayroll(w) ? money(salaryFor(w, curMonth())) : "—"}</td>${MODE === "cloud" ? `<td>${accountCell(w)}</td>` : ""}<td>${w.active === false ? pill(["موقوف"]) : pill(["نشط", "good"])}</td><td class="nowrap">${MODE === "cloud" ? `<button class="btn sm ${w.accountUid ? "" : "primary"}" data-act="account-form" data-id="${w.id}">${w.accountUid ? "الحساب" : "اعمل حساب دخول"}</button> ` : ""}<button class="btn sm" data-act="edit-worker" data-id="${w.id}">تعديل</button> <button class="btn sm" data-act="worker-log" data-id="${w.id}">حركاته</button></td></tr>`).join("") : emptyRow(MODE === "cloud" ? 6 : 5, "لسه ما ضفتش موظفين.")}
   </tbody></table></div></section>
   <div class="grid2">
   <section class="panel"><h2>بيانات المزرعة</h2><form id="set-form" class="form">${field("اسم المزرعة", `<input type="text" name="farmName" id="set-farm" value="${esc(s.farmName || "")}">`)}${field("اسمك", `<input type="text" name="ownerName" id="set-owner" value="${esc(s.ownerName || "")}">`)}<div class="f full"><button class="btn primary" type="submit" style="align-self:flex-start">حفظ</button></div></form></section>
   <section class="panel"><h2>البيانات والنسخ الاحتياطي</h2><p class="small muted">${MODE === "cloud" ? `البيانات محفوظة على السحابة في حساب <b dir="ltr">${esc(accountName())}</b> ومتزامنة مع كل الأجهزة.` : "كل البيانات محفوظة على هذا الموبايل فقط."} آخر نسخة احتياطية: <b>${s.lastBackup ? fmtDT(s.lastBackup) : "لم تُعمل بعد"}</b></p>
   <div class="actions">${MODE === "cloud" ? `<button class="btn" data-act="account">حسابي</button>` : ""}<button class="btn primary" data-act="backup">نسخة احتياطية / استرجاع</button><button class="btn danger" data-act="reset">مسح كل البيانات</button></div></section></div>
+  <section class="panel"><h2>حجم الكلام على الموبايل ده</h2>${fontSizeSeg()}</section>
   <p class="small muted">Pets Home — ${MODE === "cloud" ? "نسخة السحابة" : "نسخة محلية"} (${APP_VERSION})</p>`;
 };
 afterRender.admin = () => {
@@ -1347,10 +1471,10 @@ function itemForm(existing) {
   openModal(existing ? `تعديل صنف ${i.name}` : "صنف جديد", `<div class="form">
     ${field("اسم الصنف", `<input type="text" name="name" id="f-name" value="${esc(i.name || "")}" required>`, "full")}
     ${field("وحدة القياس", `<select name="unit" id="f-unit">${UNITS.map(u => opt(u, u, i.unit)).join("")}</select>`)}
-    ${field("الطبق الواحد =", numInput("perPlate", i.perPlate, "required"), "", "وزن أو عدد الطبق الواحد بالوحدة المختارة")}
+    ${field("الطبق الواحد فيه كام؟", numInput("perPlate", i.perPlate, "required"), "", "مثلاً 2 يعني الطبق = 2 كجم (بالوحدة اللي فوق)")}
     ${field("سعر البيع", numInput("price", i.price))}
-    ${field("السعر على", `<select name="priceBasis" id="f-priceBasis">${opt("plate", "الطبق", i.priceBasis)}${opt("unit", "الوحدة (كجم/عدد…)", i.priceBasis)}</select>`)}
-    ${field("تنبيه رصيد منخفض عند (أطباق)", numInput("minPlates", i.minPlates))}
+    ${field("السعر محسوب على", `<select name="priceBasis" id="f-priceBasis">${opt("plate", "الطبق", i.priceBasis)}${opt("unit", "الكيلو / العدد", i.priceBasis)}</select>`)}
+    ${field("نبّهني لما الرصيد يقل عن (طبق)", numInput("minPlates", i.minPlates), "", "اختياري. هيظهر لك تنبيه في الرئيسية")}
     <label class="check f"><input type="checkbox" name="active" id="f-active" ${i.active !== false ? "checked" : ""}> الصنف نشط</label></div>`, {
     done: "تم الحفظ",
     onSubmit: async fd => {
@@ -1380,6 +1504,8 @@ function workerForm(existing) {
       if (existing) {
         const next = Object.assign({}, existing, data);
         if (onPayroll(existing)) { if (!data.active && existing.active !== false && !existing.endMonth) next.endMonth = curMonth(); if (data.active) delete next.endMonth; }
+        const a = existing.accountUid && ACCOUNTS.get(existing.accountUid);
+        if (a && (a.name !== name || (!data.active && a.active))) { const na = Object.assign({}, a, { name, active: data.active ? a.active : false }); ACCOUNTS.set(existing.accountUid, na); B.batchWrite([{ kind: "set", col: "accounts", id: existing.accountUid, data: na }]).catch(cloudFail); }
         await Store.put("workers", existing.id, next); audit("تعديل", "worker", existing.id, `تعديل بيانات ${name}`, existing, next);
       } else {
         const salary = fnum(fd, "salary");
@@ -1388,6 +1514,58 @@ function workerForm(existing) {
         const id = Store.newId(); await Store.put("workers", id, Object.assign(data, { at: nowISO() }));
         audit("إضافة", "worker", id, `إضافة موظف ${name}${data.salary ? ` بمرتب ${money(data.salary)} من ${monthLabel(data.startMonth)}` : ""}`);
       }
+    }
+  });
+}
+
+/* ---------- Employee logins (cloud) ---------- */
+function accountCell(w) {
+  const a = w.accountUid && ACCOUNTS.get(w.accountUid);
+  if (!a) return `<span class="muted small">—</span>`;
+  return `<span dir="ltr">${esc(a.username)}</span> ${a.active ? pill(["شغال", "good"]) : pill(["موقوف"])}`;
+}
+function accountForm(empId) {
+  const w = S.workers.get(empId); if (!w) return;
+  if (MODE !== "cloud") return toast("حسابات دخول الموظفين بتشتغل مع السحابة بس.");
+  const a = w.accountUid ? ACCOUNTS.get(w.accountUid) : null;
+  const perms = (a && a.perms) || { production: true, withdraw: true, orders: true };
+  openModal(a ? `حساب ${w.name}` : `حساب دخول لـ${w.name}`, `<p class="intro">${a ? "تقدر تغيّر هو يقدر يعمل إيه، أو توقف الحساب." : `اعمل لـ${esc(w.name)} اسم مستخدم وكلمة سر يدخل بيهم من موبايله. هيشوف بس الحاجات اللي هتعلّم عليها، ومش هيشوف المرتبات ولا الأرباح.`}</p>
+    <div class="form">
+      ${a ? `<div class="f full"><span class="small muted">اسم المستخدم</span><b dir="ltr">${esc(a.username)}</b></div>`
+        : `${field("اسم المستخدم", `<input type="text" name="username" id="f-username" dir="ltr" autocapitalize="none" spellcheck="false" autocomplete="off" placeholder="mahmoud">`, "", "حروف إنجليزي صغيرة وأرقام")}
+           ${field("كلمة السر", `<input type="text" name="password" id="f-password" dir="ltr" autocomplete="off">`, "", "6 حروف أو أرقام على الأقل")}`}
+      <fieldset class="f full perms"><legend>يقدر يعمل إيه؟</legend>${PERMS.map(([k, l]) => `<label class="check"><input type="checkbox" name="p_${k}" id="f-p_${k}" ${perms[k] ? "checked" : ""}> ${l}</label>`).join("")}</fieldset>
+      ${a ? `<label class="check f full"><input type="checkbox" name="active" id="f-active" ${a.active !== false ? "checked" : ""}> الحساب شغال (لو شلت العلامة مش هيقدر يدخل)</label>` : ""}
+    </div>`, {
+    submitLabel: a ? "حفظ" : "اعمل الحساب",
+    onSubmit: async fd => {
+      const pm = {}; PERMS.forEach(([k]) => { if (fd.get("p_" + k) === "on") pm[k] = true; });
+      if (a) {
+        const next = Object.assign({}, a, { perms: pm, active: fd.get("active") === "on", name: w.name });
+        try { await B.batchWrite([{ kind: "set", col: "accounts", id: w.accountUid, data: next }]); } catch (ex) { return "تعذر الحفظ. اتأكد إن النت شغال."; }
+        ACCOUNTS.set(w.accountUid, next); render();
+        audit("تعديل", "account", w.accountUid, `تعديل حساب دخول ${w.name}${next.active ? "" : " (موقوف)"}`);
+        return { msg: next.active ? `اتحفظت صلاحيات ${w.name}` : `حساب ${w.name} اتوقف` };
+      }
+      const username = fv(fd, "username").toLowerCase(), password = (fd.get("password") || "").toString();
+      if (!/^[a-z0-9._-]{3,30}$/.test(username)) return "اسم المستخدم: حروف إنجليزي صغيرة وأرقام (3 على الأقل).";
+      if (password.length < 6) return "كلمة السر 6 حروف أو أرقام على الأقل.";
+      if (navigator.onLine === false) return "عمل حساب جديد محتاج إنترنت.";
+      let uid;
+      try { uid = await B.createAccount(username, password); }
+      catch (ex) {
+        const c = ex && ex.code;
+        if (c === "auth/email-already-in-use") return "اسم المستخدم ده موجود. اختار اسم تاني.";
+        if (c === "auth/operation-not-allowed" || c === "auth/admin-restricted-operation") return "لازم يتفعّل «Enable create (sign-up)» في إعدادات Firebase الأول.";
+        return authMsg(ex);
+      }
+      const acc = { workerId: w.id, name: w.name, username, perms: pm, active: true, at: nowISO() };
+      try { await B.batchWrite([{ kind: "set", col: "accounts", id: uid, data: acc }]); } catch (ex) { return "اتعمل الحساب بس ما اتفعّلش. جرّب «اعمل حساب دخول» تاني باسم مستخدم مختلف."; }
+      ACCOUNTS.set(uid, acc);
+      await Store.put("workers", w.id, Object.assign({}, w, { accountUid: uid, username }));
+      audit("إضافة", "account", uid, `عمل حساب دخول لـ${w.name} (${username})`);
+      return () => { openModal("الحساب جاهز", `<p>ابعت لـ${esc(w.name)} البيانات دي. يفتح رابط التطبيق ويدخل بيها:</p><div class="sum-box" dir="ltr"><div><span>Username</span><b>${esc(username)}</b></div><div><span>Password</span><b>${esc(password)}</b></div></div><p class="small muted">لو نسي كلمة السر: أوقف الحساب ده واعمل له حساب جديد باسم مستخدم مختلف.</p>`,
+        { noFocus: true, extra: `<button type="button" class="btn primary" id="cred-share">ابعتها واتساب</button>` }); $("#cred-share").onclick = () => shareOrCopy("Pets Home", `Pets Home\n${location.origin + location.pathname}\nUsername: ${username}\nPassword: ${password}`, "اتنسخت"); };
     }
   });
 }
@@ -1459,7 +1637,7 @@ VIEWS.payroll = () => {
   const emps = workers(true).filter(w => { const r = payRow(w.id, ym); return (onPayroll(w) && w.active !== false) || r.base || r.entries.length || Math.abs(r.due) > 0.005; });
   const noSalary = workers().filter(w => !onPayroll(w));
   const cell = (v, sign) => v ? sgn(sign + nf(v)) : "—";
-  return `${headHtml("المرتبات", `شهر ${monthLabel(ym)}${ym === curMonth() ? " (الحالي)" : ""}`, `<button class="btn primary" data-act="pe-new" data-id="advance">+ سلفة</button><button class="btn" data-act="pe-new" data-id="deduct">+ خصم / مكافأة</button><button class="btn" data-act="pe-new" data-id="payout">صرف مرتب</button>`)}
+  return `${headHtml("المرتبات", `شهر ${monthLabel(ym)}${ym === curMonth() ? " (الحالي)" : ""}`, `<button class="btn" data-go="attendance">الحضور</button><button class="btn primary" data-act="pe-new" data-id="advance">+ سلفة</button><button class="btn" data-act="pe-new" data-id="deduct">+ خصم / مكافأة</button><button class="btn" data-act="pe-new" data-id="payout">صرف مرتب</button>`)}
   <div class="monthnav"><button type="button" class="btn sm" data-act="pay-month" data-id="${prevMonth(ym)}">الشهر السابق</button><b>${monthLabel(ym)}</b>${ym < curMonth() ? `<button type="button" class="btn sm" data-act="pay-month" data-id="${nextMonth(ym)}">الشهر التالي</button>` : `<span class="btn sm" style="visibility:hidden">الشهر التالي</span>`}</div>
   <section class="kpis" aria-label="ملخص المرتبات">
     <div class="kpi hero"><span>المتبقي للصرف</span><b class="num">${money(T.remaining)}</b><small>تم صرف ${money(T.payout)}</small></div>
@@ -1468,7 +1646,7 @@ VIEWS.payroll = () => {
     <div class="kpi"><span>خصومات وغياب</span><b class="num">${money(r2(T.deduct + T.absence))}</b><small>مكافآت ${sgn("+" + nf(T.bonus))}</small></div>
   </section>
   <section class="panel"><div class="panel-head"><h2>الموظفين</h2><button class="btn sm" data-act="new-worker">+ موظف</button></div>
-  <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الموظف</th><th class="n">المرتب</th><th class="n">مرحّل</th><th class="n">مكافآت</th><th class="n">خصومات وغياب</th><th class="n">سلف</th><th class="n">مصروف</th><th class="n">المتبقي</th><th></th></tr></thead><tbody>
+  <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الموظف</th><th class="n">المرتب</th><th class="n">باقي من الشهر اللي فات</th><th class="n">مكافآت</th><th class="n">خصومات وغياب</th><th class="n">سلف</th><th class="n">مصروف</th><th class="n">المتبقي</th><th></th></tr></thead><tbody>
   ${emps.length ? emps.map(w => { const r = payRow(w.id, ym); return `<tr><td><b>${esc(w.name)}</b>${w.active === false ? ` ${pill(["موقوف"])}` : ""}</td><td class="n">${nf(r.base)}</td><td class="n">${r.carry ? sgn((r.carry > 0 ? "+" : "−") + nf(Math.abs(r.carry))) : "—"}</td><td class="n pos">${cell(r.bonus, "+")}</td><td class="n neg">${cell(r2(r.deduct + r.absence), "−")}</td><td class="n neg">${cell(r.advance, "−")}</td><td class="n">${cell(r.payout, "−")}</td><td class="n"><b class="num">${nf(Math.abs(r.due))}</b> ${dueLabel(r.due)}</td>
     <td class="nowrap"><button class="btn sm" data-act="pe-new" data-id="advance" data-emp="${w.id}">سلفة</button> <button class="btn sm" data-act="pe-new" data-id="deduct" data-emp="${w.id}">خصم</button> <button class="btn sm" data-act="pe-new" data-id="bonus" data-emp="${w.id}">مكافأة</button> <button class="btn sm" data-act="pe-new" data-id="payout" data-emp="${w.id}">صرف</button> <button class="btn sm" data-act="emp-st" data-id="${w.id}">الكشف</button></td></tr>`; }).join("")
     : emptyRow(9, "لا يوجد موظفين على المرتبات. اضغط «+ موظف» وحدد المرتب الشهري.")}
@@ -1490,7 +1668,7 @@ function payEntryForm(type, empId, existing) {
     ${field("التاريخ", dateInput("date", p.date))}
     ${field("ملاحظة", `<input type="text" name="note" id="f-note" value="${esc(p.note || "")}" placeholder="مثال: سلفة نقدي">`)}
     <div class="f full"><div class="sum-box" id="pe-sum"></div></div></div>`, {
-    submitLabel: existing ? "حفظ التعديل" : "تسجيل", done: existing ? "تم حفظ التعديل" : "تم التسجيل",
+    submitLabel: existing ? "حفظ التعديل" : "سجّل",
     onSubmit: async fd => {
       const t = fv(fd, "type"), amount = fnum(fd, "amount"), emp = fv(fd, "empId");
       if (!PAY_TYPES[t]) return "اختر النوع.";
@@ -1498,8 +1676,9 @@ function payEntryForm(type, empId, existing) {
       const data = { empId: emp, type: t, amount: r2(amount), date: fv(fd, "date") || today(), note: fv(fd, "note"), by: OWNER_ID };
       if (t === "absence") { const dd = fnum(fd, "days"); if (isFinite(dd) && dd > 0) data.days = r2(dd); }
       const sum = `${PAY_TYPES[t].short} ${money(data.amount)} — ${wName(emp)}${data.days ? ` (${nf(data.days)} يوم)` : ""}${data.note ? " — " + data.note : ""}`;
-      if (existing) { const next = Object.assign({}, existing, data, { editedAt: nowISO() }); if (t !== "absence") delete next.days; await Store.put("payroll", existing.id, next); audit("تعديل", "payroll", existing.id, "تعديل " + sum, existing, next); }
-      else { const id = Store.newId(); await Store.put("payroll", id, Object.assign(data, { at: nowISO() })); audit("إضافة", "payroll", id, sum); }
+      const left = () => { const d = payRow(emp, data.date.slice(0, 7)).due; return d >= 0 ? `الباقي له ${money(d)}` : `عليه ${money(-d)} يتخصموا الشهر الجاي`; };
+      if (existing) { const next = Object.assign({}, existing, data, { editedAt: nowISO() }); if (t !== "absence") delete next.days; await Store.put("payroll", existing.id, next); audit("تعديل", "payroll", existing.id, "تعديل " + sum, existing, next); return saved(`اتعدل. ${left()}`, "payroll", existing.id, existing); }
+      else { const id = Store.newId(); await Store.put("payroll", id, Object.assign(data, { at: nowISO() })); audit("إضافة", "payroll", id, sum); return saved(`اتسجل ${PAY_TYPES[t].short} ${money(data.amount)} لـ${wName(emp)}. ${left()}`, "payroll", id, null); }
     }
   });
   const $f = n => form.querySelector(`[name=${n}]`);
@@ -1678,6 +1857,141 @@ function resetAll() {
   });
 }
 
+/* ================== Suppliers ==================
+   Purchases on credit (an expense with payType "credit" and a supplierId) add to what is owed;
+   a supplier payment (finance record, kind "supplierPay") reduces it. A payment moves cash but is not a new expense. */
+const suppliers = () => [...S.suppliers.values()].sort((a, b) => (a.name || "").localeCompare(b.name || "", "ar"));
+const supplierName = id => (S.suppliers.get(id) || {}).name || "مورد";
+function supplierBalances() {
+  return memo("supb", () => {
+    const m = new Map();
+    for (const x of S.finance.values()) {
+      if (!x.supplierId) continue;
+      if (x.kind === "expense" && x.payType === "credit") m.set(x.supplierId, r2((m.get(x.supplierId) || 0) + (+x.amount || 0)));
+      if (x.kind === "supplierPay") m.set(x.supplierId, r2((m.get(x.supplierId) || 0) - (+x.amount || 0)));
+    }
+    return m;
+  });
+}
+VIEWS.suppliers = () => {
+  const bal = supplierBalances(), list = suppliers();
+  const total = [...bal.values()].reduce((a, v) => a + Math.max(0, v), 0);
+  const loose = [...S.finance.values()].filter(x => x.kind === "expense" && x.payType === "credit" && !x.supplierId).reduce((a, x) => a + (+x.amount || 0), 0);
+  const stat = id => { let bought = 0, credit = 0, paid = 0; for (const x of S.finance.values()) if (x.supplierId === id) { if (x.kind === "expense") { bought += +x.amount || 0; if (x.payType === "credit") credit += +x.amount || 0; } if (x.kind === "supplierPay") paid += +x.amount || 0; } return { bought, credit, paid }; };
+  return `${headHtml("الموردين وحساباتهم", `عليك للموردين: <b class="money">${money(r2(total))}</b>`, `<button class="btn primary" data-act="supplier-pay">سداد لمورد</button><button class="btn" data-act="new-supplier">+ مورد</button>`)}
+  <p class="intro">لما تشتري حاجة آجل، سجّلها كمصروف «آجل» واختار المورد. لما تدفع له، اضغط «سداد لمورد». التطبيق بيحسب عليك كام لكل مورد.</p>
+  <section class="panel"><div class="tbl-wrap"><table class="rtable"><thead><tr><th>المورد</th><th>التليفون</th><th class="n">اشتريت منه</th><th class="n">منها آجل</th><th class="n">دفعت له</th><th class="n">عليك له</th><th></th></tr></thead><tbody>
+  ${list.length ? list.map(v => { const st = stat(v.id), due = bal.get(v.id) || 0; return `<tr><td><b>${esc(v.name)}</b>${v.note ? ` <span class="small muted">${esc(v.note)}</span>` : ""}</td><td dir="ltr" style="text-align:start">${esc(v.phone || "—")}</td><td class="n">${nf(st.bought)}</td><td class="n">${nf(st.credit)}</td><td class="n">${nf(st.paid)}</td><td class="n ${due > 0.005 ? "neg" : ""}"><b>${nf(due)}</b></td>
+    <td class="nowrap">${due > 0.005 ? `<button class="btn sm primary" data-act="supplier-pay" data-id="${v.id}">سداد</button> ` : ""}<button class="btn sm" data-act="supplier-st" data-id="${v.id}">كشف حساب</button>${v.phone ? ` <a class="btn sm" href="tel:${esc(v.phone)}">اتصال</a>` : ""}${isMgr() ? ` <button class="btn sm" data-act="edit-supplier" data-id="${v.id}">تعديل</button>` : ""}</td></tr>`; }).join("") : emptyRow(7, "لسه مفيش موردين. ضيف المورد من هنا أو وانت بتسجل مصروف.")}
+  </tbody></table></div>
+  ${loose > 0.005 ? `<p class="small muted">في مصروفات آجل بـ${money(r2(loose))} من غير مورد محدد. افتحها من «المصروفات» واختار المورد عشان تتحسب هنا.</p>` : ""}</section>`;
+};
+function supplierForm(existing) {
+  const v = existing || {};
+  openModal(existing ? "تعديل بيانات مورد" : "مورد جديد", `<div class="form">${field("اسم المورد", `<input type="text" name="name" id="f-name" value="${esc(v.name || "")}" required>`, "full")}${field("التليفون", `<input type="tel" name="phone" id="f-phone" dir="ltr" value="${esc(v.phone || "")}">`)}${field("ملاحظة", `<input type="text" name="note" id="f-note" value="${esc(v.note || "")}" placeholder="مثال: ردة وأكل">`)}</div>`, {
+    done: "اتحفظ",
+    onSubmit: async fd => {
+      const name = fv(fd, "name"); if (!name) return "اكتب اسم المورد.";
+      const data = { name, phone: fv(fd, "phone"), note: fv(fd, "note") };
+      if (existing) { const next = Object.assign({}, existing, data); await Store.put("suppliers", existing.id, next); audit("تعديل", "supplier", existing.id, `تعديل بيانات مورد ${name}`, existing, next); }
+      else { const id = Store.newId(); await Store.put("suppliers", id, Object.assign(data, { at: nowISO() })); audit("إضافة", "supplier", id, `إضافة مورد ${name}`); }
+    }
+  });
+}
+function supplierPayForm(supplierId, existing) {
+  const all = suppliers(); if (!all.length) { toast("ضيف مورد الأول من «الموردين»."); go("suppliers"); return; }
+  const x = existing || { supplierId: supplierId || (all.find(v => (supplierBalances().get(v.id) || 0) > 0) || all[0]).id, date: today() };
+  const form = openModal(existing ? "تعديل سداد لمورد" : "سداد لمورد", `<div class="form">
+    ${field("المورد", `<select name="supplierId" id="f-supplierId">${all.map(v => opt(v.id, `${v.name} — عليك له ${nf(supplierBalances().get(v.id) || 0)}`, x.supplierId)).join("")}</select>`, "full")}
+    ${field("دفعت كام؟", numInput("amount", x.amount, "required"))}
+    ${field("التاريخ", dateInput("date", x.date))}
+    ${field("طريقة الدفع", `<select name="method" id="f-method">${["كاش", "تحويل / محفظة", "شيك"].map(m => opt(m, m, x.method)).join("")}</select>`)}
+    ${field("ملاحظة", `<input type="text" name="note" id="f-note" value="${esc(x.note || "")}">`)}</div>`, {
+    submitLabel: existing ? "حفظ التعديل" : "سجّل السداد",
+    onSubmit: async fd => {
+      const amount = fnum(fd, "amount"); if (!isFinite(amount) || amount <= 0) return "اكتب مبلغ أكبر من صفر.";
+      const data = { kind: "supplierPay", supplierId: fv(fd, "supplierId"), amount: r2(amount), date: fv(fd, "date") || today(), method: fv(fd, "method"), payType: "cash", note: fv(fd, "note"), by: byVal(fd) };
+      const sum = `سداد ${money(data.amount)} للمورد ${supplierName(data.supplierId)}`;
+      const left = () => { const d = supplierBalances().get(data.supplierId) || 0; return d > 0.005 ? `باقي عليك له ${money(d)}` : "حسابه بقى خالص"; };
+      if (existing) { const next = Object.assign({}, existing, data, { editedAt: nowISO() }); await Store.put("finance", existing.id, next); audit("تعديل", "finance", existing.id, "تعديل " + sum, existing, next); return saved(`اتعدل السداد. ${left()}`, "finance", existing.id, existing); }
+      const id = Store.newId(); await Store.put("finance", id, Object.assign(data, { at: nowISO() })); audit("إضافة", "finance", id, sum);
+      return saved(`اتسجل ${sum}. ${left()}`, "finance", id, null);
+    }
+  });
+  const sel = form.querySelector("[name=supplierId]"), amt = form.querySelector("[name=amount]");
+  const fill = () => { if (!existing) { const d = supplierBalances().get(sel.value) || 0; amt.value = d > 0 ? d : ""; } };
+  sel.onchange = fill; fill();
+}
+function supplierStatement(id) {
+  const rows = [...S.finance.values()].filter(x => x.supplierId === id && ((x.kind === "expense" && x.payType === "credit") || x.kind === "supplierPay")).sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.at || "") < (b.at || "") ? -1 : 1);
+  let bal = 0;
+  const body = `<div class="tbl-wrap"><table class="rtable"><thead><tr><th>البيان</th><th>التاريخ</th><th class="n">اشتريت آجل</th><th class="n">دفعت</th><th class="n">عليك له</th></tr></thead><tbody>
+    ${rows.length ? rows.map(x => { const inc = x.kind === "expense"; bal = r2(bal + (inc ? +x.amount : -x.amount)); return `<tr><td>${inc ? `${esc(x.category)}${x.note ? " — " + esc(x.note) : ""}` : `سداد (${esc(x.method || "كاش")})`}</td><td class="nowrap">${fmtDate(x.date)}</td><td class="n">${inc ? nf(x.amount) : "—"}</td><td class="n">${inc ? "—" : nf(x.amount)}</td><td class="n"><b>${nf(bal)}</b></td></tr>`; }).join("") : emptyRow(5, "مفيش مشتريات آجل أو سداد لسه.")}
+    </tbody></table></div>`;
+  openModal(`كشف حساب ${supplierName(id)}`, body, { wide: true, noFocus: true, extra: `<button type="button" class="btn primary" data-act="supplier-pay" data-id="${id}">سداد</button>` });
+  labelTables($("#modal-root"));
+}
+
+/* ================== Attendance ==================
+   Everyone counts as present. Marking someone absent saves a payroll "absence" entry for that day
+   (fixed id att-<date>-<employee>, so it can be undone by marking them present again). */
+let attDate = null;
+const attId = (date, empId) => `att-${date}-${empId}`;
+VIEWS.attendance = () => {
+  const d = attDate || today(), ym = d.slice(0, 7);
+  const emps = workers().filter(w => onPayroll(w) && salaryFor(w, ym) > 0);
+  const state = w => { const p = S.payroll.get(attId(d, w.id)); return !p ? "in" : (+p.days || 1) < 1 ? "half" : "out"; };
+  const absent = emps.filter(w => state(w) !== "in").length, half = emps.filter(w => state(w) === "half").length;
+  return `${headHtml("حضور الموظفين", "الكل حاضر إلا اللي تعلّم عليه. الغياب بيتخصم من المرتب لوحده (يوم = المرتب ÷ 30).", `<button class="btn" data-go="payroll">المرتبات</button>`)}
+  <section class="panel"><div class="panel-head"><h2>${dayName(d)} ${fmtDate(d)}</h2><span class="hint">حاضر ${emps.length - absent}${half ? ` · نص يوم ${half}` : ""}${absent - half ? ` · غايب ${absent - half}` : ""}</span></div>
+  <div class="filters"><label>اليوم<input type="date" id="att-date" value="${d}" max="${today()}"></label></div>
+  ${emps.length ? `<ul class="att">${emps.map(w => { const st = state(w); return `<li><b>${esc(w.name)}</b><div class="seg" role="group" aria-label="${esc(w.name)}">
+    <button type="button" data-att="in" data-id="${w.id}" aria-pressed="${st === "in"}">حاضر</button><button type="button" data-att="half" data-id="${w.id}" aria-pressed="${st === "half"}">نص يوم</button><button type="button" data-att="out" data-id="${w.id}" aria-pressed="${st === "out"}">غايب</button></div></li>`; }).join("")}</ul>`
+    : `<div class="empty">مفيش موظفين على المرتبات. ضيفهم من «المرتبات ← + موظف».</div>`}
+  </section>`;
+};
+afterRender.attendance = () => {
+  const di = $("#att-date"); if (di) di.onchange = () => { attDate = di.value || today(); di.blur(); render(); };
+  $$("[data-att]").forEach(b => b.onclick = () => setAttendance(attDate || today(), b.dataset.id, b.dataset.att));
+};
+function setAttendance(date, empId, st) {
+  const w = S.workers.get(empId); if (!w) return;
+  const id = attId(date, empId), cur = S.payroll.get(id);
+  if (st === "in") { if (cur) { Store.remove("payroll", id); audit("حذف", "payroll", id, `${w.name} حاضر يوم ${fmtDate(date)} (اتشال الغياب)`); toast(`${w.name}: حاضر`); } return; }
+  const days = st === "half" ? 0.5 : 1, amount = r2(salaryFor(w, date.slice(0, 7)) / 30 * days);
+  Store.put("payroll", id, { empId, type: "absence", days, amount, date, note: st === "half" ? "نص يوم (من الحضور)" : "غياب (من الحضور)", src: "attendance", by: me().id, at: nowISO() });
+  audit(cur ? "تعديل" : "إضافة", "payroll", id, `${w.name} ${st === "half" ? "نص يوم" : "غايب"} يوم ${fmtDate(date)} — خصم ${money(amount)}`);
+  toast(`${w.name}: ${st === "half" ? "نص يوم" : "غايب"}، اتخصم ${money(amount)}`);
+}
+
+/* ================== Help ================== */
+VIEWS.help = () => `${headHtml("إزاي أستخدم التطبيق", "خطوات قصيرة لأهم الحاجات.")}
+  <section class="panel help">
+    <h2>أول مرة</h2><ol>
+      <li>من «الإعدادات» ضيف كل صنف: اسمه، الطبق فيه كام كيلو أو عدد، وسعره.</li>
+      <li>من «المخزون» اضغط «الموجود في الغرفة دلوقتي» واكتب عدد الأطباق من كل صنف.</li>
+      <li>من «المرتبات» ضيف الموظفين ومرتب كل واحد.</li></ol>
+    <h2>كل يوم</h2><ul>
+      <li><b>إنتاج:</b> زرار + ← «سجّل إنتاج»: اختار الصنف واكتب عدد الأطباق.</li>
+      <li><b>أوردر:</b> زرار + ← «أوردر جديد»: العميل، الأصناف والأطباق، ودفع كام. الفاتورة بتطلع لوحدها وتقدر تبعتها واتساب.</li>
+      <li><b>مصروف:</b> زرار + ← «مصروف جديد». لو آجل اختار المورد.</li>
+      <li><b>موظف أخد فلوس:</b> زرار + ← «سلفة لموظف». بتتخصم من مرتبه لوحدها.</li>
+      <li><b>غياب:</b> «حضور الموظفين»: علّم على اللي غاب.</li>
+      <li>لو سجلت حاجة غلط: اضغط «تراجع» في الرسالة اللي بتظهر تحت بعد الحفظ.</li></ul>
+    <h2>آخر الشهر</h2><ul>
+      <li><b>المكسب:</b> «التقارير والأرباح» ← «الأرباح الشهرية».</li>
+      <li><b>المرتبات:</b> من «المرتبات» اضغط «صرف» لكل موظف. المبلغ بيتحسب لوحده بعد السلف والخصومات.</li></ul>
+    <h2>من غير نت</h2><p>سجّل عادي. كل حاجة بتترفع لوحدها لما النت يرجع.</p>
+    <h2>الكلام صغير؟</h2><p>من «المزيد» ← «حجم الكلام» اختار «كبير» أو «أكبر».</p>
+  </section>`;
+
+/* ================== Text size (per phone) ================== */
+const FS = [["1", "عادي"], ["1.12", "كبير"], ["1.25", "أكبر"]];
+const fontSize = () => { const v = lsGet("petshome:fs"); return FS.some(f => f[0] === v) ? v : "1.12"; };
+function applyFontSize() { document.documentElement.style.setProperty("--fs", fontSize()); }
+const fontSizeSeg = () => `<div class="seg" role="group" aria-label="حجم الكلام">${FS.map(([v, l]) => `<button type="button" data-act="fs" data-id="${v}" aria-pressed="${fontSize() === v}">${l}</button>`).join("")}</div>`;
+applyFontSize();
+
 /* ================== Cloud: sign-in, account, moving phone data up ================== */
 const AUTH_MSG = {
   "auth/invalid-credential": "اسم المستخدم أو كلمة السر غير صحيحة.", "auth/wrong-password": "اسم المستخدم أو كلمة السر غير صحيحة.",
@@ -1689,7 +2003,7 @@ const authMsg = e => AUTH_MSG[e && e.code] || "حصل خطأ. حاول تاني.
 const accountName = () => ((authUser && authUser.email) || "").split("@")[0];
 function renderLogin(app) {
   app.innerHTML = `<div class="screen"><form class="card" id="auth-form" novalidate>
-    <div><div class="logo">Pets Home</div><p class="muted">سجّل الدخول بحساب المزرعة. البيانات محفوظة على السحابة ومتزامنة بين كل الأجهزة.</p></div>
+    <div><div class="logo">Pets Home</div><p class="muted">ادخل باسم المستخدم وكلمة السر. لو انت موظف، المدير هيديهوملك.</p></div>
     <div class="form">
       ${field("اسم المستخدم", `<input type="text" name="user" id="a-user" dir="ltr" autocapitalize="none" autocomplete="username" spellcheck="false" value="${esc(lsGet("petshome:lastUser") || "")}">`, "full")}
       ${field("كلمة السر", `<input type="password" name="pass" id="a-pass" dir="ltr" autocomplete="current-password">`, "full")}
@@ -1705,9 +2019,9 @@ function renderLogin(app) {
     catch (ex) { const er = $("#a-err"); if (er) { er.textContent = authMsg(ex); er.hidden = false; } const b = $("#a-submit"); if (b) b.disabled = false; }
   });
 }
-function renderDenied(app) {
+function renderDenied(app, worker) {
   app.innerHTML = `<div class="screen"><div class="card"><div class="logo">Pets Home</div>
-    <p>الحساب <b dir="ltr">${esc(accountName())}</b> ليس له صلاحية على بيانات المزرعة.</p><p class="small muted">ادخل بحساب المزرعة.</p>
+    <p>${worker ? `الحساب <b dir="ltr">${esc(accountName())}</b> موقوف أو لسه ما اتفعّلش.` : `الحساب <b dir="ltr">${esc(accountName())}</b> ليس له صلاحية على بيانات المزرعة.`}</p><p class="small muted">${worker ? "كلّم المدير." : "ادخل بحساب المزرعة."}</p>
     <button type="button" class="btn primary block" data-act="logout">تسجيل الخروج</button></div></div>`;
 }
 function accountSheet() {
@@ -1723,9 +2037,18 @@ function accountSheet() {
     }
   });
 }
-function signOutCloud() { closeModal(true); Cloud.stop(); cloudBooted = false; if (B) B.signOut(); }
+function signOutCloud() { closeModal(true); Cloud.stop(); cloudBooted = false; if (acctUnsub) { acctUnsub(); acctUnsub = null; } acct = undefined; ACCOUNTS = new Map(); if (B) B.signOut(); }
+/* Names of employees for screens an employee login sees (they can't read the employee list itself, which has salaries). */
+function syncPeople() {
+  if (MODE !== "cloud" || !isMgr() || !Cloud.isReady()) return;
+  const names = {}; S.workers.forEach((w, id) => names[id] = w.name);
+  const cur = S.meta.get("people");
+  if (!cur || JSON.stringify(cur.names || {}) !== JSON.stringify(names)) Store.put("meta", "people", { names });
+}
 async function cloudAfterReady() {
+  if (!isMgr()) return;
   try {
+    syncPeople();
     const marker = await Local.getKey("__meta_cloud");
     if ((S.meta.size || recordCount()) && (!marker || marker.appVersion !== APP_VERSION)) await Local.snapshot(`نسخة من السحابة قبل التحديث إلى ${APP_VERSION}`, marker && marker.appVersion);
     await Local.putKey("__meta_cloud", { appVersion: APP_VERSION, updatedAt: nowISO() });
@@ -1736,7 +2059,7 @@ async function cloudAfterReady() {
 }
 const countData = d => ["items", "workers", "customers", ...BUCKETED].reduce((a, c) => a + Object.keys((d && d[c]) || {}).length, 0);
 function uploadBanner() {
-  if (MODE !== "cloud" || !localPending || localPending.hidden) return "";
+  if (MODE !== "cloud" || !isMgr() || !localPending || localPending.hidden) return "";
   return `<div class="banner info">على الموبايل ده ${nf(localPending.count, 0)} سجل اتسجلوا قبل التحويل للسحابة${localPending.demo ? " (فيهم بيانات تجريبية)" : ""}. <button type="button" class="linkbtn" data-act="upload-local">ارفعهم للحساب</button> · <button type="button" class="linkbtn" data-act="skip-upload">مش دلوقتي</button> · <button type="button" class="linkbtn" data-act="never-upload">ماترفعهمش</button></div>`;
 }
 function uploadLocal() {
@@ -1772,6 +2095,12 @@ document.addEventListener("click", e => {
   const id = b.dataset.id; const act = b.dataset.act;
   const H = {
     "backup": backupSheet, "reset": resetAll,
+    "fs": () => { lsSet("petshome:fs", id); applyFontSize(); if (modalOpen) { $$(".fsize [data-act=fs]").forEach(x => x.setAttribute("aria-pressed", x.dataset.id === id)); } else render(); },
+    "hide-onboard": () => { const st = Object.assign({}, settings(), { onboarded: true }); delete st.id; Store.put("meta", "settings", st); },
+    "day-summary": () => shareOrCopy("ملخص النهارده", daySummaryText(today()), "اتنسخ الملخص، الصقه في واتساب"),
+    "remind": () => { const c = S.customers.get(id); if (c) shareOrCopy("تذكير", reminderText(c, (custBalances().get(id) || {}).due || 0), "اتنسخت الرسالة"); },
+    "new-supplier": () => supplierForm(), "edit-supplier": () => { const v = S.suppliers.get(id); if (v) supplierForm(v); },
+    "supplier-pay": () => supplierPayForm(id), "supplier-st": () => supplierStatement(id),
     "account": accountSheet, "logout": signOutCloud,
     "upload-local": uploadLocal, "skip-upload": () => { if (localPending) localPending.hidden = true; render(); },
     "never-upload": () => confirmBox("عدم رفع بيانات الموبايل", "السجلات اللي على الموبايل ده مش هتترفع للحساب ومش هيتسأل عنها تاني. هتفضل محفوظة على الموبايل نفسه.", "تمام، ماترفعهمش", async () => { await Local.putKey("__uploaded", { at: nowISO(), skipped: true }); localPending = null; }),
@@ -1798,11 +2127,12 @@ document.addEventListener("click", e => {
     "new-customer": () => customerForm(), "edit-customer": () => { const c = S.customers.get(id); if (c) customerForm(c); },
     "statement": () => { openModal(`كشف حساب ${custName(id)}`, statementHtml(id, "", ""), { wide: true, noFocus: true, extra: `<button type="button" class="btn primary" id="st-share">${navigator.share ? "مشاركة الكشف" : "نسخ الكشف"}</button>` }); labelTables($("#modal-root")); $("#st-share").onclick = () => shareOrCopy("كشف حساب", statementText(id, "", ""), "تم نسخ كشف الحساب"); },
     "new-expense": () => financeForm("expense"), "new-income": () => financeForm("income"),
-    "edit-fin": () => { const x = S.finance.get(id); if (x) financeForm(x.kind || "expense", x); },
-    "del-fin": () => { const x = S.finance.get(id); if (!x) return; confirmBox("حذف", `حذف ${x.kind === "income" ? "إيراد" : "مصروف"} ${esc(x.category)} بمبلغ ${money(x.amount)}؟`, "حذف", () => { Store.remove("finance", id); audit("حذف", "finance", id, `حذف ${x.kind === "income" ? "إيراد" : "مصروف"} ${x.category} ${money(x.amount)} بتاريخ ${fmtDate(x.date)} (سجّله ${wName(x.by)})`); }); },
+    "edit-fin": () => { const x = S.finance.get(id); if (!x) return; if (x.kind === "supplierPay") supplierPayForm(x.supplierId, x); else financeForm(x.kind || "expense", x); },
+    "del-fin": () => { const x = S.finance.get(id); if (!x) return; confirmBox("حذف", `حذف ${x.kind === "income" ? "إيراد" : x.kind === "supplierPay" ? "سداد لـ" + esc(supplierName(x.supplierId)) : "مصروف " + esc(x.category)} بمبلغ ${money(x.amount)}؟`, "حذف", () => { Store.remove("finance", id); audit("حذف", "finance", id, `حذف ${x.kind === "income" ? "إيراد" : x.kind === "supplierPay" ? "سداد مورد" : "مصروف"} ${x.category || supplierName(x.supplierId)} ${money(x.amount)} بتاريخ ${fmtDate(x.date)} (سجّله ${wName(x.by)})`); }); },
     "save-count": saveCount, "clear-count": () => { Object.keys(countDraft).forEach(k => delete countDraft[k]); render(); },
     "new-item": () => itemForm(), "edit-item": () => { const i = S.items.get(id); if (i) itemForm(i); },
     "new-worker": () => workerForm(), "edit-worker": () => { const w = S.workers.get(id); if (w) workerForm(w); },
+    "account-form": () => accountForm(id),
     "month-report": () => { rp.tab = "monthly"; rp.month = id; go("reports"); },
     "worker-log": () => { lg.worker = id; lg.from = addDays(today(), -29); lg.to = today(); go("log"); },
     "export": backupSheet
@@ -1829,7 +2159,21 @@ async function boot() {
     try { const mod = await import("./backend.js"); B = mod.createBackend(window.PETSHOME_FIREBASE); }
     catch (e) { console.error(e); phase = "cloudfail"; render(); return; }
     phase = "ready";
-    B.onAuth(u => { if (!u && Cloud.started) Cloud.stop(); if (!u) cloudBooted = false; authUser = u; render(); });
+    B.onAuth(u => {
+      if (!u && Cloud.started) Cloud.stop();
+      if (!u) cloudBooted = false;
+      if (acctUnsub) { acctUnsub(); acctUnsub = null; }
+      authUser = u; acct = undefined;
+      if (u && u.email !== ADMIN_EMAIL) {
+        /* Employee login: load its account; if the manager changes what it may do, restart the listeners. */
+        acctUnsub = B.watchDoc("accounts", u.uid, d => {
+          const before = acct; acct = d;
+          if (Cloud.started && before !== undefined && JSON.stringify((before && before.perms) || {}) !== JSON.stringify((d && d.perms) || {})) Cloud.stop();
+          render();
+        }, err => { console.error(err); acct = null; render(); });
+      }
+      render();
+    });
     render();
     return;
   }
@@ -1849,6 +2193,6 @@ async function boot() {
   await Local.putKey("__meta", { schema: SCHEMA, appVersion: APP_VERSION, updatedAt: nowISO() });
   phase = "ready"; render();
 }
-window.PH = { version: APP_VERSION, get mode() { return MODE; }, _debug: { Cloud, payLedger, payRow, payrollMonth, salaryFor, payEntryForm, empStatement, salaryForm, uploadLocal, get localPending() { return localPending; }, S, Store, Local, go, me, balance, custBalances, orderPayState, moneySummary, allAudit, setPreset, rp, render, saveCount, countDraft, moveForm, orderForm, paymentForm, financeForm, workerForm, closeModal, stockSummary, seedDemo, backupData, importBackup, lastBy, monthReport, dataMonths, monthText } };
+window.PH = { version: APP_VERSION, get mode() { return MODE; }, _debug: { accountForm, get ACCOUNTS() { return ACCOUNTS; }, get acct() { return acct; }, isWorker, can, me, syncPeople, supplierBalances, supplierPayForm, setAttendance, daySummaryText, onboarding, waNumber, Cloud, payLedger, payRow, payrollMonth, salaryFor, payEntryForm, empStatement, salaryForm, uploadLocal, get localPending() { return localPending; }, S, Store, Local, go, me, balance, custBalances, orderPayState, moneySummary, allAudit, setPreset, rp, render, saveCount, countDraft, moveForm, orderForm, paymentForm, financeForm, workerForm, closeModal, stockSummary, seedDemo, backupData, importBackup, lastBy, monthReport, dataMonths, monthText } };
 boot();
 })();

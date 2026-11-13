@@ -1,14 +1,67 @@
 rules_version = '2';
 // Pets Home security rules — paste into Firebase console → Firestore Database → Rules → Publish.
-// Only the farm's admin account (username "Hegazy") can read or write anything.
-// Employee accounts will be added here later.
+//
+// - The farm's manager account (username "Hegazy") can read and write everything.
+// - Employee logins only work once the manager has made them in the app (accounts/<uid> with active == true),
+//   and each one only reaches what the manager ticked for it. Employees never see salaries, payroll or the
+//   employee list, and can't delete anything.
+// - Everyone with an active login can see the stock (items, production, orders, counts) so the room balance is right.
 service cloud.firestore {
   match /databases/{database}/documents {
-    function admin() {
-      return request.auth != null && request.auth.token.email == "hegazy@petshome.local";
+    function signedIn() { return request.auth != null; }
+    function admin() { return signedIn() && request.auth.token.email == "hegazy@petshome.local"; }
+    function acctPath() { return /databases/$(database)/documents/accounts/$(request.auth.uid); }
+    function member() { return signedIn() && exists(acctPath()) && get(acctPath()).data.active == true; }
+    function can(p) { return member() && get(acctPath()).data.perms.get(p, false) == true; }
+    function sales() { return can("orders") || can("payments"); }
+    function readType(t) {
+      return t == "moves" || t == "orders" || t == "counts"
+        || (t == "payments" && sales())
+        || (t == "finance" && can("finance"));
     }
-    match /{document=**} {
+    function writeType(t) {
+      return (t == "moves" && (can("production") || can("withdraw") || can("count")))
+        || (t == "orders" && can("orders"))
+        || (t == "payments" && sales())
+        || (t == "finance" && can("finance"))
+        || (t == "counts" && can("count"));
+    }
+
+    match /accounts/{uid} {
+      allow read: if admin() || (signedIn() && request.auth.uid == uid);
+      allow write: if admin();
+    }
+    match /meta/{id} {
+      allow read: if admin() || member();
+      allow write: if admin();
+    }
+    match /items/{id} {
+      allow read: if admin() || member();
+      allow write: if admin();
+    }
+    match /workers/{id} {
       allow read, write: if admin();
+    }
+    match /customers/{id} {
+      allow read, create, update: if admin() || sales();
+      allow delete: if admin();
+    }
+    match /suppliers/{id} {
+      allow read, create, update: if admin() || can("finance");
+      allow delete: if admin();
+    }
+    // Records grouped by month: ledger/<type>_<YYYY-MM> with { type, month, r: { <id>: record } }.
+    match /ledger/{id} {
+      allow read: if admin() || (member() && readType(resource.data.type));
+      allow create: if admin() || (member() && writeType(request.resource.data.type));
+      allow update: if admin() || (member() && writeType(resource.data.type) && request.resource.data.type == resource.data.type);
+      allow delete: if admin();
+    }
+    // Activity log: one document per day, only ever added to.
+    match /audit/{id} {
+      allow read: if admin() || can("log");
+      allow create, update: if admin() || member();
+      allow delete: if false;
     }
   }
 }
