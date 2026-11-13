@@ -35,6 +35,8 @@ async def main():
         src = os.path.join(ROOT, f)
         if os.path.isdir(src): shutil.copytree(src, os.path.join(site, f))
         else: shutil.copy(src, os.path.join(site, f))
+    with open(os.path.join(site, "firebase-config.js"), "w") as fh:   # phone starts in local mode
+        fh.write('window.PETSHOME_FIREBASE = { apiKey: "PASTE_API_KEY_HERE" };\n')
     srv = subprocess.Popen([sys.executable, "-m", "http.server", str(PORT), "--bind", "127.0.0.1", "--directory", site], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1); url = f"http://localhost:{PORT}/"; fails = []
     def check(ok, msg):

@@ -1,12 +1,11 @@
-// Cloud connection for Pets Home. While apiKey starts with "PASTE", the app runs in local mode
-// (data only on the phone). With real values from the Firebase console it switches to cloud mode:
-// sign-in with the farm account and live sync between devices.
+// Cloud connection for Pets Home (Firebase project "pets-home-6cd2f").
+// Set back to apiKey: "PASTE_API_KEY_HERE" to return the app to local mode.
 // These values are not secret: access is protected by sign-in and the rules in firestore.rules.
 window.PETSHOME_FIREBASE = {
-  apiKey: "PASTE_API_KEY_HERE",
-  authDomain: "",
-  projectId: "",
-  storageBucket: "",
-  messagingSenderId: "",
-  appId: ""
+  apiKey: "AIzaSyBMGIECoTbJbtoJcMO1eyVzfETf-DkIAwI",
+  authDomain: "pets-home-6cd2f.firebaseapp.com",
+  projectId: "pets-home-6cd2f",
+  storageBucket: "pets-home-6cd2f.firebasestorage.app",
+  messagingSenderId: "655428711270",
+  appId: "1:655428711270:web:3d7070572f077e13270ea7"
 };

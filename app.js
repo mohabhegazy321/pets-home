@@ -28,7 +28,7 @@ const pnum = v => { const x = parseFloat(String(v ?? "").trim().replace(/[٠-٩]
 const nowISO = () => new Date().toISOString();
 
 /* ================== State & on-device storage ================== */
-const APP_VERSION = "v3";
+const APP_VERSION = "v3.1";
 /* Storage format version. Raise it only together with a migration in MIGRATIONS below — never by changing or dropping saved data. */
 const SCHEMA = 1;
 const PLAIN = ["meta", "items", "workers", "customers"];
@@ -570,7 +570,7 @@ function renderWelcome(app) {
   const cloud = MODE === "cloud";
   app.innerHTML = `<div class="screen"><form class="card" id="welcome" novalidate>
     <div><div class="logo">Pets Home</div><p class="muted">${cloud ? "أول مرة على الحساب ده: اكتب بيانات المزرعة. أي جهاز هيدخل بنفس الحساب هيشوف نفس البيانات." : "نسخة تجريبية تعمل على هذا الموبايل فقط، بدون إنترنت وبدون حسابات. كل البيانات تُحفظ على الجهاز."}</p></div>
-    ${cloud && localPending ? `<div class="banner info">على الموبايل ده ${nf(localPending.count, 0)} سجل محفوظين من قبل. ارفعهم للحساب عشان تكمل بنفس البيانات.</div><button class="btn primary block" type="button" data-act="upload-local">رفع بيانات الموبايل للحساب</button>` : ""}
+    ${cloud && localPending ? `<div class="banner info">على الموبايل ده ${nf(localPending.count, 0)} سجل محفوظين من قبل. ارفعهم للحساب عشان تكمل بنفس البيانات.</div><button class="btn primary block" type="button" data-act="upload-local">رفع بيانات الموبايل للحساب</button>${localPending.demo ? `<p class="small muted">الموبايل ده فيه بيانات تجريبية. لو مش عايزها على الحساب اضغط «ابدأ من غير بيانات الموبايل».</p>` : ""}` : ""}
     <div class="form">
       ${field("اسم المزرعة", `<input type="text" name="farm" id="w-farm" value="Pets Home">`, "full")}
       ${field("اسمك", `<input type="text" name="name" id="w-name" autocomplete="name">`, "full", "يظهر في سجل العمليات")}
@@ -1737,7 +1737,7 @@ async function cloudAfterReady() {
 const countData = d => ["items", "workers", "customers", ...BUCKETED].reduce((a, c) => a + Object.keys((d && d[c]) || {}).length, 0);
 function uploadBanner() {
   if (MODE !== "cloud" || !localPending || localPending.hidden) return "";
-  return `<div class="banner info">على الموبايل ده ${nf(localPending.count, 0)} سجل اتسجلوا قبل التحويل للسحابة. <button type="button" class="linkbtn" data-act="upload-local">ارفعهم للحساب</button> · <button type="button" class="linkbtn" data-act="skip-upload">مش دلوقتي</button></div>`;
+  return `<div class="banner info">على الموبايل ده ${nf(localPending.count, 0)} سجل اتسجلوا قبل التحويل للسحابة${localPending.demo ? " (فيهم بيانات تجريبية)" : ""}. <button type="button" class="linkbtn" data-act="upload-local">ارفعهم للحساب</button> · <button type="button" class="linkbtn" data-act="skip-upload">مش دلوقتي</button> · <button type="button" class="linkbtn" data-act="never-upload">ماترفعهمش</button></div>`;
 }
 function uploadLocal() {
   if (!localPending) return;
@@ -1746,7 +1746,7 @@ function uploadLocal() {
     if (S[c].has(id)) return;
     ops.push({ op: "put", col: c, id, data: rec }); if (c !== "meta") n++;
   });
-  openModal("رفع بيانات الموبايل", `<p>هيترفع <b>${nf(n, 0)}</b> سجل من الموبايل ده للحساب، ومعاهم سجل العمليات.</p><p class="small muted">السجلات اللي موجودة على الحساب بالفعل مش هتتغير، والبيانات على الموبايل هتفضل زي ما هي.</p>`, {
+  openModal("رفع بيانات الموبايل", `<p>هيترفع <b>${nf(n, 0)}</b> سجل من الموبايل ده للحساب، ومعاهم سجل العمليات.</p>${localPending.demo ? `<p class="banner">الموبايل ده استخدم «البيانات التجريبية». لو السجلات دي كلها تجريبية اختار «ماترفعهمش».</p>` : ""}<p class="small muted">السجلات اللي موجودة على الحساب بالفعل مش هتتغير، والبيانات على الموبايل هتفضل زي ما هي.</p>`, {
     submitLabel: "رفع البيانات", noFocus: true,
     onSubmit: async () => {
       Store.bulk(ops); mergeAudit(d.audit);
@@ -1774,6 +1774,7 @@ document.addEventListener("click", e => {
     "backup": backupSheet, "reset": resetAll,
     "account": accountSheet, "logout": signOutCloud,
     "upload-local": uploadLocal, "skip-upload": () => { if (localPending) localPending.hidden = true; render(); },
+    "never-upload": () => confirmBox("عدم رفع بيانات الموبايل", "السجلات اللي على الموبايل ده مش هتترفع للحساب ومش هيتسأل عنها تاني. هتفضل محفوظة على الموبايل نفسه.", "تمام، ماترفعهمش", async () => { await Local.putKey("__uploaded", { at: nowISO(), skipped: true }); localPending = null; }),
     "pay-month": () => { payMonth = id; render(); },
     "pe-new": () => payEntryForm(id, b.dataset.emp),
     "edit-pe": () => { const p = S.payroll.get(id); if (p) payEntryForm(p.type, p.empId, p); },
@@ -1822,8 +1823,8 @@ async function boot() {
     MODE = "cloud";
     Local.snapInfo = r.ok ? await Local.getKey("__snapshot_info") : null;
     if (r.ok) {
-      const n = countData(r.data), done = await Local.getKey("__uploaded"), demo = r.data.meta && r.data.meta.settings && r.data.meta.settings.demo;
-      if (n > 0 && !done && !demo) localPending = { data: r.data, count: n };
+      const n = countData(r.data), done = await Local.getKey("__uploaded"), demo = !!(r.data.meta && r.data.meta.settings && r.data.meta.settings.demo);
+      if (n > 0 && !done) localPending = { data: r.data, count: n, demo };
     }
     try { const mod = await import("./backend.js"); B = mod.createBackend(window.PETSHOME_FIREBASE); }
     catch (e) { console.error(e); phase = "cloudfail"; render(); return; }

@@ -81,6 +81,17 @@ async def main():
                 missing = [f"{c}/{rid}" for c in cols if c != "audit" for rid in (before[c] or {}) if rid not in (snap.get(c) or {})]
                 print("automatic snapshot:", after["__snapshot"]["info"]["reason"], "| covers all old records:", not missing)
                 if missing: fails.append(f"snapshot missing {len(missing)} records")
+            mode = await pg.evaluate("window.PH && window.PH.mode")
+            if mode == "cloud":
+                # Cloud settings are published: the phone's own records stay on the phone untouched
+                # (checked above) and are offered for upload after sign-in. Upload itself: dev/cloud_test.py.
+                pend = await pg.evaluate("(() => { const p = window.PH._debug.localPending; return p ? p.count : 0; })()")
+                n_rec = sum(len(before.get(c) or {}) for c in cols if c not in ("meta", "audit"))
+                print(f"new version runs in cloud mode: {pend} phone records waiting to be offered for upload (expected {n_rec})")
+                if pend != n_rec: fails.append(f"phone records not offered for upload ({pend} of {n_rec})")
+                if errs: fails.append("page errors: " + "; ".join(errs))
+                await b.close()
+                return finish(fails, srv, site)
             # 4. the app shows the same numbers and can still save
             shown = await pg.evaluate("(() => { const D = window.PH._debug; return { orders: D.S.orders.size, probe: D.S.finance.get('upgrade-probe') && D.S.finance.get('upgrade-probe').amount }; })()")
             if shown["orders"] != len(before.get("orders") or {}) or shown["probe"] != 123.45: fails.append(f"app shows different data: {shown}")
@@ -90,8 +101,15 @@ async def main():
             if not saved: fails.append("new entries are not saved after the update")
             if errs: fails.append("page errors: " + "; ".join(errs))
             await b.close()
+    except SystemExit:
+        raise
     finally:
         srv.terminate(); shutil.rmtree(site, ignore_errors=True)
+    finish(fails, None, None)
+
+def finish(fails, srv, site):
+    if srv: srv.terminate()
+    if site: shutil.rmtree(site, ignore_errors=True)
     print("RESULT:", "PASS — all data kept" if not fails else "FAIL\n  " + "\n  ".join(fails))
     sys.exit(1 if fails else 0)
 
