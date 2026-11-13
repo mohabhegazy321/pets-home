@@ -54,4 +54,4 @@ Workers are a simple list of names. Pick **العامل المسؤول** on each
 
 ## Updating the app
 
-Replace the changed files in the GitHub repository. The phone picks up the new version the second time the app is opened with internet. Data is not affected.
+Updates are pushed to the GitHub repository. On the phone, just refresh or reopen the app while online. The farm's data stays on the phone through every update, and the app saves an automatic copy before a new version first runs. You can restore that copy from **المزيد → نسخة احتياطية**.

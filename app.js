@@ -25,7 +25,9 @@ const pnum = v => { const x = parseFloat(String(v ?? "").trim().replace(/[٠-٩]
 const nowISO = () => new Date().toISOString();
 
 /* ================== State & on-device storage ================== */
-const APP_VERSION = "local-1";
+const APP_VERSION = "local-2";
+/* Storage format version. Raise it only together with a migration in MIGRATIONS below — never by changing or dropping saved data. */
+const SCHEMA = 1;
 const PLAIN = ["meta", "items", "workers", "customers"];
 const BUCKETED = ["moves", "orders", "payments", "finance", "counts"];
 const COLS = [...PLAIN, ...BUCKETED, "audit"];
@@ -54,33 +56,63 @@ const Local = {
       req.onblocked = () => res(null);
     });
   },
+  canWrite: false, snapInfo: null,
+  /* Returns { ok, data }. ok=false means the saved data could not be read: the app must not start empty and save over it. */
   async init() {
     this.db = await this.open();
+    if (!this.db && window.indexedDB) return { ok: false, data: {} };
     try { this.chan = new BroadcastChannel("petshome-local"); this.chan.onmessage = e => this.reload(e.data && e.data.cols); } catch {}
     return this.read(COLS);
   },
   read(cols) {
     if (!this.db) {
-      const out = {}; cols.forEach(c => { try { out[c] = JSON.parse(lsGet("petshome:col:" + c) || "{}"); } catch { out[c] = {}; } });
-      return Promise.resolve(out);
+      const out = {}; let ok = true;
+      cols.forEach(c => { try { out[c] = JSON.parse(lsGet("petshome:col:" + c) || "{}"); } catch { ok = false; } });
+      return Promise.resolve({ ok, data: out });
     }
     return new Promise(res => {
-      const out = {}; let tx;
-      try { tx = this.db.transaction("kv", "readonly"); } catch { return res(out); }
+      const out = {}; let tx, ok = true;
+      try { tx = this.db.transaction("kv", "readonly"); } catch { return res({ ok: false, data: out }); }
       const st = tx.objectStore("kv");
-      cols.forEach(c => { const r = st.get(c); r.onsuccess = () => { out[c] = r.result || {}; }; });
-      tx.oncomplete = () => res(out); tx.onerror = () => res(out); tx.onabort = () => res(out);
+      cols.forEach(c => { const r = st.get(c); r.onsuccess = () => { out[c] = r.result || {}; }; r.onerror = () => { ok = false; }; });
+      tx.oncomplete = () => res({ ok, data: out }); tx.onerror = () => res({ ok: false, data: out }); tx.onabort = () => res({ ok: false, data: out });
     });
+  },
+  /* Single extra keys (version marker, snapshots) stored next to the collections. */
+  getKey(key) {
+    if (!this.db) { try { return Promise.resolve(JSON.parse(lsGet("petshome:" + key) || "null")); } catch { return Promise.resolve(null); } }
+    return new Promise(res => {
+      try { const r = this.db.transaction("kv", "readonly").objectStore("kv").get(key); r.onsuccess = () => res(r.result ?? null); r.onerror = () => res(null); }
+      catch { res(null); }
+    });
+  },
+  putKey(key, val) {
+    if (!this.db) { try { localStorage.setItem("petshome:" + key, JSON.stringify(val)); return Promise.resolve(true); } catch { return Promise.resolve(false); } }
+    return new Promise(res => {
+      try { const tx = this.db.transaction("kv", "readwrite"); tx.objectStore("kv").put(val, key); tx.oncomplete = () => res(true); tx.onerror = tx.onabort = () => res(false); }
+      catch { res(false); }
+    });
+  },
+  /* Saves a full copy of the farm data on the phone before anything that replaces data (app update, reset, restore). */
+  async snapshot(reason, fromVersion) {
+    if (S.meta.size === 0 && recordCount() === 0) return false;   // never replace a good snapshot with an empty one
+    const data = {}; COLS.forEach(c => data[c] = fromMap(S[c]));
+    const info = { reason, at: nowISO(), fromVersion: fromVersion || APP_VERSION, count: recordCount() };
+    const ok = await this.putKey("__snapshot", { info, data });
+    if (ok) { await this.putKey("__snapshot_info", info); this.snapInfo = info; }
+    return ok;
   },
   async reload(cols) {
     if (!Array.isArray(cols) || !cols.length) return;
-    const data = await this.read(cols);
+    const r = await this.read(cols); if (!r.ok) return;
+    const data = r.data;
     cols.forEach(c => { if (COLS.includes(c) && !this.dirty.has(c)) S[c] = toMap(data[c]); });
     ver++; scheduleRender();
   },
   mark(col) { this.dirty.add(col); clearTimeout(this.timer); this.timer = setTimeout(() => this.flush(), 200); },
   flush() {
     clearTimeout(this.timer);
+    if (!this.canWrite) return Promise.resolve();
     const cols = [...this.dirty]; this.dirty.clear();
     if (!cols.length) return Promise.resolve();
     const payload = {}; cols.forEach(c => payload[c] = fromMap(S[c]));
@@ -378,6 +410,12 @@ function render() {
   const app = $("#app");
   const ae = document.activeElement;
   if (ae && app.contains(ae) && /INPUT|SELECT|TEXTAREA/.test(ae.tagName)) { renderPending = true; return; }
+  if (phase === "readfail") {
+    app.innerHTML = `<div class="screen"><div class="card"><div class="logo">Pets Home</div><p>تعذر قراءة بيانات المزرعة من الموبايل. بياناتك لم تُمسح.</p>
+      <p class="small muted">اقفل التطبيق تماماً وافتحه تاني. لو المشكلة استمرت، تأكد إن في مساحة فاضية على الموبايل.</p>
+      <button type="button" class="btn primary block" onclick="location.reload()">إعادة المحاولة</button></div></div>`;
+    return;
+  }
   if (phase !== "ready") return screenMsg(app, "جاري فتح Pets Home…");
   if (!S.meta.get("settings")) return renderWelcome(app);
   if (!routeOf(route)?.ok()) route = "dashboard";
@@ -443,7 +481,9 @@ function renderWelcome(app) {
     <button class="btn primary block" type="submit">ابدأ</button>
     <button class="btn block" type="button" id="w-demo">جرّب ببيانات تجريبية أولاً</button>
     <label class="linkbtn" style="text-align:center">عندي نسخة احتياطية، استرجعها<input type="file" id="w-restore" accept=".json,application/json" hidden></label>
+    ${Local.snapInfo && Local.snapInfo.count ? `<button class="btn block" type="button" id="w-snap">استرجاع البيانات السابقة من النسخة التلقائية (${nf(Local.snapInfo.count, 0)} سجل)</button>` : ""}
   </form></div>`;
+  const ws = $("#w-snap"); if (ws) ws.onclick = restoreSnapshot;
   $("#welcome").addEventListener("submit", e => {
     e.preventDefault(); const fd = new FormData(e.target); const name = fv(fd, "name");
     if (!name) { const er = $("#w-err"); er.textContent = "اكتب اسمك."; er.hidden = false; return; }
@@ -515,6 +555,7 @@ VIEWS.dashboard = () => {
     <div class="kpi ${totalReceivable() > 0 ? "bad" : ""}"><span>مستحق على العملاء</span><b class="num">${money(totalReceivable())}</b><small>الآجل والمتبقي</small></div>
   </section>
   ${backupNag()}${low.length ? `<div class="banner">رصيد منخفض: ${low.map(i => `${esc(i.name)} (${nf(ss.get(i.id).closing)} طبق)`).join("، ")}</div>` : ""}
+  ${monthPanel()}
   <div class="grid2">
     <section class="panel"><div class="panel-head"><h2>رصيد الغرفة لكل صنف</h2><a href="#stock" data-go="stock" class="small">تفاصيل الحركة</a></div>
       <div class="tbl-wrap"><table class="rtable"><thead><tr><th>الصنف</th><th class="n">الأطباق</th><th class="n">الكمية</th><th>الحالة</th></tr></thead><tbody>
@@ -935,7 +976,7 @@ function saveCount() {
   toast(apply ? "تم حفظ الجرد وتسوية الأرصدة" : "تم حفظ الجرد"); render();
 }
 
-let rp = { preset: "today", from: today(), to: today(), tab: "stock", cust: "" };
+let rp = { preset: "today", from: today(), to: today(), tab: "monthly", cust: "", month: today().slice(0, 7) };
 function setPreset(p) {
   const t = today(); rp.preset = p;
   if (p === "today") { rp.from = t; rp.to = t; }
@@ -943,11 +984,69 @@ function setPreset(p) {
   else if (p === "month") { rp.from = t.slice(0, 8) + "01"; rp.to = t; }
   else if (p === "lastmonth") { const d = new Date(t.slice(0, 8) + "01T12:00:00"); d.setDate(0); rp.to = ymd(d); rp.from = rp.to.slice(0, 8) + "01"; }
 }
-const RTABS = [["stock", "حركة المخزون"], ["production", "الإنتاج"], ["sales", "المبيعات"], ["expenses", "المصروفات"], ["pnl", "الأرباح والخسائر"], ["statement", "كشف حساب عميل"], ["cash", "حركة الخزنة"]];
-VIEWS.reports = () => `${headHtml("التقارير والحسابات", `من ${fmtDate(rp.from)} إلى ${fmtDate(rp.to)}`)}
+const MONTHS = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"];
+const curMonth = () => today().slice(0, 7);
+const monthLabel = ym => `${MONTHS[+ym.slice(5, 7) - 1]} ${ym.slice(0, 4)}`;
+const monthRange = ym => { const [y, m] = ym.split("-").map(Number); return { from: `${ym}-01`, to: `${ym}-${pad(new Date(y, m, 0).getDate())}` }; };
+const prevMonth = ym => { const [y, m] = ym.split("-").map(Number); return m === 1 ? `${y - 1}-12` : `${y}-${pad(m - 1)}`; };
+const pct = v => v == null ? "—" : nf(v, 1) + "٪";
+/* Months that have any record, newest first (the current month is always included). */
+function dataMonths() {
+  return memo("months", () => {
+    const set = new Set([curMonth()]);
+    for (const c of ["orders", "finance", "payments", "moves"]) for (const r of S[c].values()) if (r.date && r.date.slice(0, 7) <= curMonth()) set.add(r.date.slice(0, 7));
+    return [...set].sort().reverse();
+  });
+}
+const saleValue = (itemId, plates, qty) => { const it = item(itemId); if (!it) return 0; return r2((it.priceBasis === "unit" ? qty : plates) * (+it.price || 0)); };
+/* Profit for one calendar month: sales + other income − expenses, each counted on its own date (credit included). */
+function monthReport(ym) {
+  return memo("mr:" + ym, () => {
+    const { from, to } = monthRange(ym); const ms = moneySummary(from, to);
+    const revenue = r2(ms.sales + ms.income), net = ms.net;
+    let owed = 0, discounts = 0; const byItem = {};
+    for (const o of S.orders.values()) if (o.status !== "cancelled" && inRange(o.date, from, to)) {
+      owed += Math.max(0, (+o.total || 0) - orderPaid(o)); discounts += +o.discount || 0;
+      (o.lines || []).forEach(l => { const r = byItem[l.itemId] = byItem[l.itemId] || { plates: 0, qty: 0, value: 0 }; r.plates += +l.plates || 0; r.qty += +l.qty || 0; r.value += +l.total || 0; });
+    }
+    let prodPlates = 0, wdPlates = 0, wdValue = 0;
+    for (const m of S.moves.values()) if (inRange(m.date, from, to)) {
+      if (m.type === "production") prodPlates += +m.plates || 0;
+      if (m.type === "withdraw") { wdPlates += +m.plates || 0; wdValue += saleValue(m.itemId, +m.plates || 0, +m.qty || 0); }
+    }
+    const ss = stockSummary("", to); let stockValue = 0;
+    items(true).forEach(i => { const b = ss.get(i.id); if (b && b.closing > 0) stockValue += saleValue(i.id, b.closing, b.closingQ); });
+    return { ym, from, to, ms, revenue, net, margin: revenue > 0 ? net / revenue * 100 : null, owed: r2(owed), discounts: r2(discounts), byItem,
+      prodPlates: r2(prodPlates), wdPlates: r2(wdPlates), wdValue: r2(wdValue), stockValue: r2(stockValue),
+      cashIn: r2(ms.collectedAtOrder + ms.payments + ms.incomeCash), cashOut: r2(ms.expenseCash), done: to < today() };
+  });
+}
+function monthText(ym) {
+  const R = monthReport(ym), ms = R.ms, pm = prevMonth(ym), P = monthReport(pm), hasPrev = dataMonths().includes(pm);
+  return [`${settings().farmName || "Pets Home"} — ${R.done ? "أرباح شهر" : "أرباح الشهر حتى اليوم —"} ${monthLabel(ym)}`, "—".repeat(14),
+    `المبيعات: ${money(ms.sales)} (${ms.orders} أوردر)`, ms.income ? `إيرادات أخرى: ${money(ms.income)}` : null,
+    `المصروفات: ${money(ms.expense)}`, ...Object.entries(ms.byCat).sort((a, b) => b[1] - a[1]).map(([c, v]) => `  • ${c}: ${money(v)}`),
+    "—".repeat(14), `${R.net >= 0 ? "صافي الربح" : "صافي الخسارة"}: ${money(Math.abs(R.net))}${R.margin == null ? "" : ` (هامش ${pct(R.margin)})`}`,
+    hasPrev ? `مقارنة بـ${monthLabel(pm)}: ${R.net - P.net >= 0 ? "+" : "−"}${money(Math.abs(r2(R.net - P.net)))}` : null,
+    `محصّل في الشهر: ${money(R.cashIn)} · متبقي على العملاء من مبيعات الشهر: ${money(R.owed)}`].filter(Boolean).join("\n");
+}
+/* Dashboard panel: this month so far, last month's final result, and a notice in the first week of a new month. */
+function monthPanel() {
+  const cm = curMonth(), pm = prevMonth(cm), R = monthReport(cm), P = monthReport(pm);
+  const prevHas = dataMonths().includes(pm), newMonth = +today().slice(8, 10) <= 7 && prevHas;
+  return `<section class="panel"><div class="panel-head"><h2>أرباح الشهر</h2><button type="button" class="linkbtn small" data-act="month-report" data-id="${cm}">التقرير الكامل</button></div>
+    ${newMonth ? `<div class="banner info">انتهى شهر ${monthLabel(pm)}: ${P.net >= 0 ? "صافي الربح" : "صافي الخسارة"} <b class="num">${money(Math.abs(P.net))}</b>. <button type="button" class="linkbtn" data-act="month-report" data-id="${pm}">عرض تقرير الشهر</button></div>` : ""}
+    <div class="kpis two">
+      <div class="kpi hero"><span>${monthLabel(cm)} حتى اليوم</span><b class="num">${money(R.net)}</b><small>إيرادات ${money(R.revenue)} − مصروفات ${money(R.ms.expense)}</small></div>
+      ${prevHas ? `<div class="kpi"><span>${monthLabel(pm)} (مكتمل)</span><b class="num ${P.net < 0 ? "neg" : ""}">${money(P.net)}</b><small>هامش الربح ${pct(P.margin)}</small></div>`
+        : `<div class="kpi"><span>هامش الربح</span><b class="num">${pct(R.margin)}</b><small>من الإيرادات</small></div>`}
+    </div></section>`;
+}
+const RTABS = [["monthly", "الأرباح الشهرية"], ["stock", "حركة المخزون"], ["production", "الإنتاج"], ["sales", "المبيعات"], ["expenses", "المصروفات"], ["pnl", "الأرباح والخسائر"], ["statement", "كشف حساب عميل"], ["cash", "حركة الخزنة"]];
+VIEWS.reports = () => `${headHtml("التقارير والحسابات", rp.tab === "monthly" ? `أرباح شهر ${monthLabel(rp.month)}` : `من ${fmtDate(rp.from)} إلى ${fmtDate(rp.to)}`)}
   <section class="panel">
-    <div class="seg" role="group" aria-label="الفترة">${[["today", "اليوم"], ["week", "الأسبوع"], ["month", "الشهر"], ["lastmonth", "الشهر الماضي"], ["custom", "مخصص"]].map(([k, l]) => `<button type="button" data-rpp="${k}" aria-pressed="${k === rp.preset}">${l}</button>`).join("")}</div>
-    ${rp.preset === "custom" ? `<div class="filters"><label>من<input type="date" id="rp-from" value="${rp.from}"></label><label>إلى<input type="date" id="rp-to" value="${rp.to}"></label></div>` : ""}
+    ${rp.tab === "monthly" ? "" : `<div class="seg" role="group" aria-label="الفترة">${[["today", "اليوم"], ["week", "الأسبوع"], ["month", "الشهر"], ["lastmonth", "الشهر الماضي"], ["custom", "مخصص"]].map(([k, l]) => `<button type="button" data-rpp="${k}" aria-pressed="${k === rp.preset}">${l}</button>`).join("")}</div>
+    ${rp.preset === "custom" ? `<div class="filters"><label>من<input type="date" id="rp-from" value="${rp.from}"></label><label>إلى<input type="date" id="rp-to" value="${rp.to}"></label></div>` : ""}`}
     <div class="seg" role="tablist" aria-label="التقرير">${RTABS.map(([k, l]) => `<button type="button" data-rpt="${k}" aria-pressed="${k === rp.tab}">${l}</button>`).join("")}</div></section>
   <section class="panel">${REPORTS[rp.tab]()}</section>`;
 afterRender.reports = () => {
@@ -955,10 +1054,63 @@ afterRender.reports = () => {
   $$("[data-rpt]").forEach(b => b.onclick = () => { rp.tab = b.dataset.rpt; render(); });
   const f = $("#rp-from"), t = $("#rp-to"); if (f) { f.onchange = () => { rp.from = f.value || today(); f.blur(); render(); }; t.onchange = () => { rp.to = t.value || today(); t.blur(); render(); }; }
   const cs = $("#rp-cust"); if (cs) cs.onchange = () => { rp.cust = cs.value; cs.blur(); render(); };
+  const mm = $("#mr-month"); if (mm) mm.onchange = () => { rp.month = mm.value; mm.blur(); render(); };
+  $$("[data-mr]").forEach(b => b.onclick = () => { rp.month = b.dataset.mr; render(); window.scrollTo(0, 0); });
+  const msh = $("#mr-share"); if (msh) msh.onclick = () => shareOrCopy("أرباح الشهر", monthText(rp.month), "تم نسخ تقرير الشهر");
   const cp = $("#rp-copy"); if (cp) cp.onclick = () => shareOrCopy("كشف حساب", statementText(rp.cust, rp.from, rp.to), "تم نسخ كشف الحساب");
   const sel = $(".seg[role=tablist] [aria-pressed=true]"); if (sel) try { sel.scrollIntoView({ inline: "nearest", block: "nearest" }); } catch {}
 };
 const REPORTS = {
+  monthly() {
+    const months = dataMonths(); if (!months.includes(rp.month)) rp.month = months[0];
+    const R = monthReport(rp.month), ms = R.ms, pm = prevMonth(rp.month), P = monthReport(pm), hasPrev = months.includes(pm);
+    const delta = r2(R.net - P.net);
+    const rows = Object.entries(R.byItem).sort((a, b) => b[1].value - a[1].value);
+    const linesTotal = rows.reduce((a, [, r]) => a + r.value, 0);
+    return `<div class="panel-head"><h2>${R.done ? "أرباح شهر" : "أرباح الشهر حتى اليوم —"} ${monthLabel(R.ym)}</h2>${R.done ? pill(["شهر مكتمل", "good"]) : pill([`الشهر جاري، يكتمل ${fmtDate(R.to)}`, "warn"])}</div>
+    <div class="filters"><label>الشهر<select id="mr-month">${months.map(m => opt(m, monthLabel(m) + (m === curMonth() ? " (الحالي)" : ""), rp.month)).join("")}</select></label>
+      <button type="button" class="btn" id="mr-share">${navigator.share ? "مشاركة التقرير" : "نسخ التقرير"}</button></div>
+    <div class="kpis">
+      <div class="kpi hero"><span>${R.net >= 0 ? "صافي الربح" : "صافي الخسارة"}</span><b class="num">${money(Math.abs(R.net))}</b><small>${hasPrev ? `${delta >= 0 ? "▲" : "▼"} ${money(Math.abs(delta))} عن ${monthLabel(pm)}` : (R.done ? "شهر مكتمل" : "حتى اليوم")}</small></div>
+      <div class="kpi"><span>إجمالي الإيرادات</span><b class="num">${money(R.revenue)}</b><small>${ms.orders} أوردر</small></div>
+      <div class="kpi"><span>إجمالي المصروفات</span><b class="num">${money(ms.expense)}</b><small>${ms.expenseCredit ? "منها آجل " + money(ms.expenseCredit) : "كلها نقدي"}</small></div>
+      <div class="kpi"><span>هامش الربح</span><b class="num">${pct(R.margin)}</b><small>من الإيرادات</small></div>
+    </div>
+    <div class="grid2">
+      <div class="stack"><h3>حساب الربح</h3><div class="sum-box">
+        <div><span>المبيعات</span><b class="num">${money(ms.sales)}</b></div>
+        <div><span>+ إيرادات أخرى</span><b class="num">${money(ms.income)}</b></div>
+        <div class="big"><span>= إجمالي الإيرادات</span><b class="num">${money(R.revenue)}</b></div>
+        ${Object.entries(ms.byCat).sort((a, b) => b[1] - a[1]).map(([c, v]) => `<div class="small"><span>− ${esc(c)}</span><span class="num">${money(v)}</span></div>`).join("") || `<div class="small"><span>لا مصروفات مسجلة في الشهر</span><span></span></div>`}
+        <div class="big"><span>− إجمالي المصروفات</span><b class="num">${money(ms.expense)}</b></div>
+        <div class="big"><span>= ${R.net >= 0 ? "صافي الربح" : "صافي الخسارة"}</span><b class="num ${R.net >= 0 ? "pos" : "neg"}">${money(Math.abs(R.net))}</b></div></div>
+        ${hasPrev ? `<h3>مقارنة بـ${monthLabel(pm)}</h3><div class="sum-box">
+          <div class="small"><span></span><span class="muted">${MONTHS[+pm.slice(5, 7) - 1]} · ${MONTHS[+R.ym.slice(5, 7) - 1]}</span></div>
+          <div class="small"><span>الإيرادات</span><span class="num">${nf(P.revenue)} · ${nf(R.revenue)}</span></div>
+          <div class="small"><span>المصروفات</span><span class="num">${nf(P.ms.expense)} · ${nf(ms.expense)}</span></div>
+          <div class="big"><span>صافي الربح</span><b class="num">${nf(P.net)} · ${nf(R.net)}</b></div>
+          <div class="small"><span>الفرق في الربح</span><span class="num ${delta >= 0 ? "pos" : "neg"}">${delta >= 0 ? "+" : "−"}${money(Math.abs(delta))}</span></div></div>` : ""}
+      </div>
+      <div class="stack"><h3>الفلوس الفعلية في الشهر</h3><div class="sum-box">
+        <div><span>دخل الخزنة (محصّل)</span><b class="num pos">${money(R.cashIn)}</b></div>
+        <div><span>خرج من الخزنة</span><b class="num neg">${money(R.cashOut)}</b></div>
+        <div class="big"><span>صافي النقدية</span><b class="num">${money(r2(R.cashIn - R.cashOut))}</b></div>
+        <div class="small"><span>متبقي على العملاء من مبيعات الشهر</span><span class="num">${money(R.owed)}</span></div>
+        ${ms.expenseCredit ? `<div class="small"><span>مصروفات آجلة لم تُدفع</span><span class="num">${money(ms.expenseCredit)}</span></div>` : ""}</div>
+        <h3>معلومات إضافية</h3><div class="sum-box">
+        <div class="small"><span>أطباق منتجة في الشهر</span><span class="num">${nf(R.prodPlates)}</span></div>
+        <div class="small"><span>مسحوبات وتالف (بسعر البيع)</span><span class="num">${nf(R.wdPlates)} طبق · ${money(R.wdValue)}</span></div>
+        <div class="small"><span>قيمة المخزون ${R.done ? "آخر الشهر" : "الآن"} (بسعر البيع)</span><span class="num">${money(R.stockValue)}</span></div></div>
+      </div>
+    </div>
+    <h3>المبيعات حسب الصنف</h3><div class="tbl-wrap"><table class="rtable"><thead><tr><th>الصنف</th><th class="n">أطباق</th><th class="n">القيمة</th><th class="n">من المبيعات</th></tr></thead><tbody>
+    ${rows.length ? rows.map(([id, r]) => `<tr><td>${esc(itemName(id))}</td><td class="n">${nf(r.plates)}</td><td class="n">${nf(r.value)}</td><td class="n">${pct(linesTotal ? r.value / linesTotal * 100 : null)}</td></tr>`).join("") : emptyRow(4, "لا مبيعات في هذا الشهر.")}
+    </tbody>${R.discounts ? `<tfoot><tr><td colspan="2">خصومات على الأوردرات</td><td class="n" data-label="القيمة">−${nf(R.discounts)}</td><td></td></tr></tfoot>` : ""}</table></div>
+    <h3>كل الشهور</h3><div class="tbl-wrap"><table class="rtable"><thead><tr><th>الشهر</th><th class="n">الإيرادات</th><th class="n">المصروفات</th><th class="n">صافي الربح</th><th class="n">الهامش</th><th></th></tr></thead><tbody>
+    ${months.map(m => { const x = monthReport(m); return `<tr><td>${monthLabel(m)}${m === curMonth() ? ` <span class="small muted">(جاري)</span>` : ""}</td><td class="n">${nf(x.revenue)}</td><td class="n">${nf(x.ms.expense)}</td><td class="n ${x.net >= 0 ? "pos" : "neg"}"><b>${nf(x.net)}</b></td><td class="n">${pct(x.margin)}</td><td>${m === rp.month ? pill(["معروض", "acc"]) : `<button type="button" class="btn sm" data-mr="${m}">عرض</button>`}</td></tr>`; }).join("")}
+    </tbody></table></div>
+    <p class="small muted">الربح = المبيعات + الإيرادات الأخرى − المصروفات، وكل عملية محسوبة في شهرها حتى لو آجلة ولم تُدفع بعد. عشان الربح يطلع صح، سجّل كل تكاليف الإنتاج (خامات، أكل، أجور، كهرباء…) كمصروفات.</p>`;
+  },
   stock() {
     const ss = stockSummary(rp.from, rp.to);
     const rows = items(true).filter(i => i.active !== false || ss.get(i.id).closing !== 0);
@@ -1117,7 +1269,10 @@ function backupSheet() {
     <div class="sum-box"><div><span>آخر نسخة احتياطية</span><b>${s.lastBackup ? fmtDT(s.lastBackup) : "لم تُعمل بعد"}</b></div><div><span>عدد السجلات</span><b>${nf(recordCount(), 0)}</b></div></div>
     <p class="small muted">احفظ النسخة في Google Drive أو ابعتها لنفسك على واتساب مرة في الأسبوع على الأقل. نفس الملف ده هو اللي هينقل بياناتك للنسخة الأونلاين بعدين.</p>
     <div class="actions">${canShareFile ? `<button type="button" class="btn primary" id="bk-share">حفظ في Drive / واتساب</button>` : ""}<button type="button" class="btn ${canShareFile ? "" : "primary"}" id="bk-dl">تنزيل الملف</button>
-    <label class="btn">استرجاع نسخة<input type="file" id="bk-imp" accept=".json,application/json" hidden></label></div></div>`, { noFocus: true });
+    <label class="btn">استرجاع نسخة<input type="file" id="bk-imp" accept=".json,application/json" hidden></label></div>
+    ${Local.snapInfo ? `<h3>نسخة تلقائية على الموبايل</h3><div class="sum-box"><div class="small"><span>${esc(Local.snapInfo.reason)}</span><span>${fmtDT(Local.snapInfo.at)}</span></div><div class="small"><span>عدد السجلات</span><span class="num">${nf(Local.snapInfo.count, 0)}</span></div></div>
+      <p class="small muted">التطبيق بيحفظ نسخة تلقائية قبل كل تحديث وقبل أي مسح أو استرجاع.</p><div class="actions"><button type="button" class="btn" id="bk-snap">استرجاع النسخة التلقائية</button></div>` : ""}</div>`, { noFocus: true });
+  const sn = $("#bk-snap"); if (sn) sn.onclick = restoreSnapshot;
   const sh = $("#bk-share");
   if (sh) sh.onclick = async () => {
     try { await navigator.share({ files: [file()], title: "Pets Home backup" }); markBackedUp(); closeModal(); toast("تم حفظ النسخة الاحتياطية"); }
@@ -1126,12 +1281,26 @@ function backupSheet() {
   $("#bk-dl").onclick = () => { saveFile(backupName(), JSON.stringify(backupData()), "application/json"); markBackedUp(); closeModal(); };
   $("#bk-imp").onchange = e => { const f = e.target.files[0]; if (!f) return; const rd = new FileReader(); rd.onload = () => importBackup(rd.result, false); rd.readAsText(f); e.target.value = ""; };
 }
+async function restoreSnapshot() {
+  const snap = await Local.getKey("__snapshot");
+  if (!snap || !snap.data) return toast("لا توجد نسخة تلقائية.");
+  openModal("استرجاع النسخة التلقائية", `<p>هترجع البيانات زي ما كانت <b>${esc(snap.info.reason)}</b> (${fmtDT(snap.info.at)}).</p><p class="small muted">البيانات الحالية هتتحفظ كنسخة تلقائية جديدة، فتقدر ترجعلها لو احتجت.</p>`, {
+    submitLabel: "استرجاع", noFocus: true,
+    onSubmit: async () => {
+      await Local.snapshot("قبل استرجاع النسخة التلقائية");
+      COLS.forEach(c => { S[c] = toMap(snap.data[c]); Local.mark(c); }); ver++;
+      audit("استرجاع", "snapshot", "", `استرجاع النسخة التلقائية (${snap.info.reason})`);
+      await Local.flush(); toast("تم الاسترجاع");
+    }
+  });
+}
 function importBackup(text, fresh) {
   let o; try { o = JSON.parse(text); } catch { return toast("الملف ليس نسخة احتياطية صالحة."); }
   if (!o || o.app !== "petshome" || !o.data) return toast("الملف ليس نسخة احتياطية من Pets Home.");
   const cols = COLS.filter(c => o.data[c]);
   const n = cols.filter(c => c !== "meta" && c !== "audit").reduce((a, c) => a + Object.keys(o.data[c] || {}).length, 0);
-  const apply = replace => {
+  const apply = async replace => {
+    if (replace && recordCount() > 0) await Local.snapshot("قبل استرجاع نسخة احتياطية");
     cols.forEach(c => {
       const m = replace ? new Map() : new Map(S[c]);
       Object.entries(o.data[c] || {}).forEach(([id, v]) => m.set(id, Object.assign({}, v, { id })));
@@ -1153,6 +1322,7 @@ function resetAll() {
     danger: true, submitLabel: "مسح نهائي", noFocus: true,
     onSubmit: async fd => {
       if (fv(fd, "confirm") !== "مسح") return "اكتب كلمة «مسح» للتأكيد.";
+      await Local.snapshot("قبل مسح كل البيانات");
       COLS.forEach(c => { S[c] = new Map(); Local.mark(c); }); ver++; await Local.flush();
       route = "dashboard"; lsSet("petshome:lastBy", null);
     }
@@ -1193,6 +1363,7 @@ document.addEventListener("click", e => {
     "save-count": saveCount, "clear-count": () => { Object.keys(countDraft).forEach(k => delete countDraft[k]); render(); },
     "new-item": () => itemForm(), "edit-item": () => { const i = S.items.get(id); if (i) itemForm(i); },
     "new-worker": () => workerForm(), "edit-worker": () => { const w = S.workers.get(id); if (w) workerForm(w); },
+    "month-report": () => { rp.tab = "monthly"; rp.month = id; go("reports"); },
     "worker-log": () => { lg.worker = id; lg.from = addDays(today(), -29); lg.to = today(); go("log"); },
     "export": backupSheet
   };
@@ -1200,13 +1371,29 @@ document.addEventListener("click", e => {
 });
 
 /* ================== Boot ================== */
+/* Data migrations: each upgrades saved data from schema (to - 1) to `to` without losing anything.
+   Example: { to: 2, run: () => { S.items.forEach((v, id) => { if (v.newField == null) Store.put("items", id, Object.assign({}, v, { newField: 0 })); }); } } */
+const MIGRATIONS = [];
 async function boot() {
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {}); } catch {}
-  let data = {};
-  try { data = await Local.init(); } catch (e) { console.error(e); }
-  COLS.forEach(c => S[c] = toMap(data[c]));
-  ver++; phase = "ready"; render();
+  let r;
+  try { r = await Local.init(); } catch (e) { console.error(e); r = { ok: false, data: {} }; }
+  if (!r.ok) { phase = "readfail"; render(); return; }
+  COLS.forEach(c => S[c] = toMap(r.data[c]));
+  ver++;
+  Local.canWrite = true;
+  const marker = await Local.getKey("__meta");
+  Local.snapInfo = await Local.getKey("__snapshot_info");
+  const hasData = S.meta.size > 0 || recordCount() > 0;
+  if (hasData && (!marker || marker.appVersion !== APP_VERSION)) {
+    await Local.snapshot(`قبل التحديث إلى ${APP_VERSION}`, marker ? marker.appVersion : "local-1");
+  }
+  const from = marker && marker.schema ? marker.schema : 1;
+  MIGRATIONS.filter(m => m.to > from && m.to <= SCHEMA).sort((a, b) => a.to - b.to).forEach(m => m.run());
+  await Local.flush();
+  await Local.putKey("__meta", { schema: SCHEMA, appVersion: APP_VERSION, updatedAt: nowISO() });
+  phase = "ready"; render();
 }
-window.PH = { _debug: { S, Store, Local, go, me, balance, custBalances, orderPayState, moneySummary, allAudit, setPreset, rp, render, saveCount, countDraft, moveForm, orderForm, paymentForm, financeForm, workerForm, closeModal, stockSummary, seedDemo, backupData, importBackup, lastBy } };
+window.PH = { version: APP_VERSION, _debug: { S, Store, Local, go, me, balance, custBalances, orderPayState, moneySummary, allAudit, setPreset, rp, render, saveCount, countDraft, moveForm, orderForm, paymentForm, financeForm, workerForm, closeModal, stockSummary, seedDemo, backupData, importBackup, lastBy, monthReport, dataMonths, monthText } };
 boot();
 })();
